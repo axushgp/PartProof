@@ -46,10 +46,21 @@ npm run dev
 
 ---
 
-## 2. Running Tests
+## 2. Running Automated Tests
+
+### Unit Tests (Local Windows / macOS / Linux)
+Runs all core unit tests, including authentication, health checks, mock sandbox adapter, artifact manager, and policy validation:
 ```bash
-cd backend
-pytest -v
+# In backend virtual environment:
+pytest backend/tests/unit backend/tests/test_health_and_auth.py -v
+```
+
+### Real Microsandbox Integration Test (Exclusively on Vultr Host)
+The real integration test (`tests/integration/test_microsandbox_real.py`) launches actual microVMs via KVM, executes code, generates a CSV artifact, extracts it to the host, verifies network denial, and checks `msb ls` cleanup.
+It is skipped by default on Windows/Mac and must be invoked on the Vultr VM:
+```bash
+# On Vultr VM (partproof-sandbox-01 as linuxuser):
+RUN_MICROSANDBOX_INTEGRATION=1 pytest backend/tests/integration/ -v
 ```
 
 ---

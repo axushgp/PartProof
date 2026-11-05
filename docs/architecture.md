@@ -80,9 +80,13 @@ The architecture separates responsibilities across three discrete trust boundari
 * **`api/`**: REST API endpoints for authentication, task creation, plan inspection, approval/cancellation, SSE event streaming, artifact downloads, and system health status.
 * **`services/inference/`**: Vultr Serverless Inference client using an OpenAI-compatible async interface. Enforces structured JSON output parsing (`TaskPlanSchema`), latency tracking, and error handling.
 * **`services/policy/`**: Deterministic policy validator. Assesses requested capabilities, enforces maximum memory/CPU quotas, confirms network mode is `none`, and flags tasks requiring explicit user approval.
-* **`services/sandbox/`**: Abstract sandbox interface with two concrete adapters:
-  1. `MockSandboxAdapter`: Deterministic, secure local simulator used on Windows/macOS for rapid development. Explicitly flagged as simulated.
-  2. `MicrosandboxAdapter`: Direct driver for `microsandbox` SDK (v0.7.13) on Vultr Linux host using `/dev/kvm`.
+* **`services/sandbox/`**: Abstract sandbox architecture with two concrete adapters:
+  1. `BaseSandboxAdapter`: Common contract enforcing typed configuration, execution requests, process timeout bounds, and lifecycle cleanup.
+  2. `MockSandboxAdapter`: Deterministic local development adapter for Windows/macOS. Explicitly marked with `execution_mode="mock"`. Never executes untrusted code on the host OS.
+  3. `MicrosandboxAdapter`: Production driver using `microsandbox` SDK (0.7.13) via KVM on Vultr Cloud Compute (`AMD EPYC Turin`). Enforces `Network.none()`, captures independent guest kernel telemetry (`6.12.113`), and ensures context-managed microVM destruction.
+  4. `SandboxManager`: Central orchestration service managing bounded concurrency (semaphore for 1 active microVM on the 2-vCPU host), policy validation, and lifecycle reporting.
+* **`services/artifacts/`**:
+  - `ArtifactManager`: Path traversal prevention, absolute path rejection, hidden dotfile blocking, symlink rejection, and SHA-256 calculation. Enforces strict limits: max 10 artifacts, max 5MB per artifact, max 20MB total, max 64KB Python source code.
 * **`workers/`**: Single-worker background process claiming queued tasks using transactional row locking (`FOR UPDATE SKIP LOCKED`) to ensure exactly one microVM executes at a time on the 2 vCPU host.
 * **`services/verification/`**: Evidence recorder compiling the cryptographic **Execution Receipt** (SHA-256 dataset hashes, guest kernel identity, stdout/stderr, artifact manifests, and microVM destruction verification).
 

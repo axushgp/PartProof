@@ -26,17 +26,17 @@
 
 ### 2.4 Lifecycle Management & Guaranteed Cleanup
 ```python
-# Context-managed lifecycle ensures destruction even on exceptions:
-async with await Sandbox.create(
-    sandbox_id,
-    image="python:3.12-slim",
-    cpus=1,
-    memory=512,
-    network=Network.none(),
-    replace=True
-) as sandbox:
-    result = await sandbox.exec("python", ["-c", sanitized_code])
-# MicroVM immediately destroyed upon exiting context block
-```
-* After task completion or timeout, the sandbox manager confirms cleanup.
-* The execution receipt records the cleanup verification status.
+## 3. Artifact Security & Path Traversal Prevention
+* **Directory Isolation**: Artifacts are written strictly to `{ARTIFACT_STORAGE_DIR}/{task_id}/{execution_id}/`.
+* **Path Validation**: Filenames containing `/`, `\`, `..`, null bytes, control characters, or absolute path patterns are rejected with an explicit `ArtifactCollectionError`.
+* **Symlink Traversal Prevention**: Host-side file registration explicitly inspects `source_path.is_symlink()` and rejects symlinks or non-regular files to eliminate container-escape tricks via host mount symlinks.
+* **Volume Limits**: Hard maximums enforced: 10 artifacts per execution, 5 MB maximum single artifact size, 20 MB maximum total per execution, and 64 KB source code length limit.
+* **Cryptographic Hashing**: Streaming SHA-256 calculation for every collected artifact, providing tamper-evident receipts.
+
+---
+
+## 4. Execution Policy & Timeout Controls
+* **Hardware Quotas**: Enforced via backend policy validation before microVM creation (1 vCPU, 512 MB memory, max 30s default timeout, max 120s limit).
+* **Process Killing**: SDK timeout mechanism kills processes if their deadline elapses, returning exit code 124 and capturing timeout telemetry.
+* **Local Development Safety**: The `MockSandboxAdapter` never executes untrusted code on the Windows host. It uses deterministic fixtures and marks all outputs with `execution_mode="mock"`.
+* **Production Guardrail**: The system strictly refuses to run `MockSandboxAdapter` in production (`PARTPROOF_ENV="production"`).

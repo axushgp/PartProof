@@ -44,6 +44,10 @@ class Settings(BaseSettings):
 
     # Artifacts & Storage
     ARTIFACT_STORAGE_DIR: str = Field(default="./partproof_artifacts")
+    MAX_ARTIFACTS_PER_EXECUTION: int = Field(default=10)
+    MAX_ARTIFACT_SIZE_BYTES: int = Field(default=5 * 1024 * 1024)  # 5 MB
+    MAX_TOTAL_ARTIFACT_BYTES: int = Field(default=20 * 1024 * 1024)  # 20 MB
+    MAX_SOURCE_INPUT_BYTES: int = Field(default=64 * 1024)  # 64 KB
 
     # Demo Credentials
     DEMO_USER_EMAIL: str = Field(default="auditor@partproof.io")
