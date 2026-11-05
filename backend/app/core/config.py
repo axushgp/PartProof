@@ -3,6 +3,20 @@ from typing import List
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+INSECURE_DEFAULT_SECRET_KEYS = {
+    "development-insecure-secret-key-32-chars-min-needed-here!",
+    "change-this-in-production-use-a-secure-random-64-char-string",
+    "secret",
+    "changeme",
+}
+
+INSECURE_DEFAULT_DEMO_PASSWORDS = {
+    "PartProofSecureDemo2026!",
+    "password",
+    "admin",
+    "demo",
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -25,6 +39,11 @@ class Settings(BaseSettings):
     VULTR_INFERENCE_MODEL: str = Field(default="glm-5.3")
     VULTR_INFERENCE_FALLBACK_MODEL: str = Field(default="glm-5.3-flash")
     VULTR_INFERENCE_TIMEOUT_SECONDS: int = Field(default=60)
+    VULTR_INFERENCE_MAX_RETRIES: int = Field(default=3)
+    VULTR_INFERENCE_TEMPERATURE: float = Field(default=0.1)
+
+    # Planner Bounds
+    MAX_PLAN_STEPS: int = Field(default=3)
 
     # Sandbox Isolation Configuration
     SANDBOX_BACKEND: str = Field(default="mock", description="'mock' for local dev, 'microsandbox' for Vultr host")
@@ -64,13 +83,30 @@ class Settings(BaseSettings):
         return v
 
     def validate_production_invariants(self):
-        """Hard safety invariant: Production environment MUST NOT run with mock sandbox."""
-        if self.PARTPROOF_ENV == "production" and self.SANDBOX_BACKEND == "mock":
-            raise RuntimeError(
-                "CRITICAL SECURITY INVARIANT VIOLATION: "
-                "PartProof cannot run in production mode with SANDBOX_BACKEND='mock'. "
-                "Hardware-isolated Microsandbox is mandatory for production."
-            )
+        """Hard safety invariants for production environment."""
+        if self.PARTPROOF_ENV == "production":
+            if self.SANDBOX_BACKEND == "mock":
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "PartProof cannot run in production mode with SANDBOX_BACKEND='mock'. "
+                    "Hardware-isolated Microsandbox is mandatory for production."
+                )
+            if self.DEBUG is True:
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "DEBUG must be False in production."
+                )
+            if len(self.SECRET_KEY) < 32 or self.SECRET_KEY in INSECURE_DEFAULT_SECRET_KEYS:
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "A secure, randomly generated SECRET_KEY (minimum 32 characters) is mandatory in production. "
+                    "The development default key was rejected."
+                )
+            if self.DEMO_USER_PASSWORD in INSECURE_DEFAULT_DEMO_PASSWORDS:
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "Default predictable demo user password is not permitted in production."
+                )
 
 
 settings = Settings()

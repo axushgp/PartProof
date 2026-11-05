@@ -4,7 +4,7 @@ from sqlalchemy import select
 from app.database.session import engine, async_session_maker, Base
 from app.models.entities import User
 from app.core.security import get_password_hash
-from app.core.config import settings
+from app.core.config import settings, INSECURE_DEFAULT_DEMO_PASSWORDS
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,11 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    # 2. Seed demo auditor user
+    # 2. Seed demo auditor user only in development/testing or when non-default password is provided
+    if settings.PARTPROOF_ENV == "production" and settings.DEMO_USER_PASSWORD in INSECURE_DEFAULT_DEMO_PASSWORDS:
+        logger.warning("Skipping demo user seeding in production: DEMO_USER_PASSWORD uses insecure default.")
+        return
+
     async with async_session_maker() as session:
         result = await session.execute(
             select(User).where(User.email == settings.DEMO_USER_EMAIL)
@@ -30,9 +34,9 @@ async def init_db() -> None:
             )
             session.add(demo_user)
             await session.commit()
-            print(f"Created initial seed user: {settings.DEMO_USER_EMAIL}")
+            logger.info(f"Created initial seed user: {settings.DEMO_USER_EMAIL}")
         else:
-            print(f"Seed user already exists: {settings.DEMO_USER_EMAIL}")
+            logger.debug(f"Seed user already exists: {settings.DEMO_USER_EMAIL}")
 
 
 if __name__ == "__main__":

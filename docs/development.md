@@ -49,18 +49,24 @@ npm run dev
 ## 2. Running Automated Tests
 
 ### Unit Tests (Local Windows / macOS / Linux)
-Runs all core unit tests, including authentication, health checks, mock sandbox adapter, artifact manager, and policy validation:
+Runs all core unit tests, including authentication, health checks, mock sandbox adapter, artifact manager, policy validation, Vultr inference client, task planner, and task planning APIs:
 ```bash
 # In backend virtual environment:
 pytest backend/tests/unit backend/tests/test_health_and_auth.py -v
 ```
 
 ### Real Microsandbox Integration Test (Exclusively on Vultr Host)
-The real integration test (`tests/integration/test_microsandbox_real.py`) launches actual microVMs via KVM, executes code, generates a CSV artifact, extracts it to the host, verifies network denial, and checks `msb ls` cleanup.
-It is skipped by default on Windows/Mac and must be invoked on the Vultr VM:
+The real integration test (`tests/integration/test_microsandbox_real.py`) launches actual microVMs via KVM, executes code, generates a CSV artifact, extracts it to the host, verifies network denial, and checks `msb ls` cleanup:
 ```bash
 # On Vultr VM (partproof-sandbox-01 as linuxuser):
-RUN_MICROSANDBOX_INTEGRATION=1 pytest backend/tests/integration/ -v
+RUN_MICROSANDBOX_INTEGRATION=1 pytest backend/tests/integration/test_microsandbox_real.py -v
+```
+
+### Live Vultr Serverless Inference Integration Test
+The live inference test (`tests/integration/test_vultr_inference_real.py`) tests direct connectivity to `https://api.vultrinference.com/v1`, requests a structured plan using `glm-5.3`, validates schema compliance, and verifies token/latency metadata:
+```bash
+# On Vultr VM or with VULTR_INFERENCE_API_KEY configured:
+VULTR_INFERENCE_API_KEY="your-key" RUN_VULTR_INFERENCE_INTEGRATION=1 pytest backend/tests/integration/test_vultr_inference_real.py -v
 ```
 
 ---

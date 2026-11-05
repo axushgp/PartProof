@@ -39,4 +39,18 @@
 * **Hardware Quotas**: Enforced via backend policy validation before microVM creation (1 vCPU, 512 MB memory, max 30s default timeout, max 120s limit).
 * **Process Killing**: SDK timeout mechanism kills processes if their deadline elapses, returning exit code 124 and capturing timeout telemetry.
 * **Local Development Safety**: The `MockSandboxAdapter` never executes untrusted code on the Windows host. It uses deterministic fixtures and marks all outputs with `execution_mode="mock"`.
-* **Production Guardrail**: The system strictly refuses to run `MockSandboxAdapter` in production (`PARTPROOF_ENV="production"`).
+---
+
+## 5. Cognitive Plane Security & Prompt Hardening
+* **Inference Credential Isolation**: The Vultr Serverless Inference API key resides exclusively in host memory (`VULTR_INFERENCE_API_KEY`). It is never passed into the sandbox microVM, never returned in API responses, and automatically redacted from application logs.
+* **Prompt Injection Defense**: User task descriptions are treated as untrusted data payloads. System prompts explicitly instruct the model to ignore attempts to leak credentials, override system rules, or run unrestricted commands.
+* **Schema Gating**: The backend never executes raw LLM strings. Output is parsed as JSON, strictly validated against `TaskPlanSchema`, checked for step limits (max 3), execution types (strictly `python`), and safe artifact filenames via `ArtifactManager`.
+* **Planning / Execution Decoupling**: Planning never triggers code execution. After successful planning, the task enters `awaiting_approval` and waits for explicit user authorization.
+
+---
+
+## 6. Production Invariants & Configuration Hardening
+* **Secret Key Enforcement**: In production (`PARTPROOF_ENV="production"`), `SECRET_KEY` must be a high-entropy custom secret (>= 32 characters). Known development defaults are hard-rejected at startup.
+* **Debug Guardrail**: `DEBUG` must be False in production.
+* **Demo Password Guardrail**: Default predictable demo passwords are prohibited in production.
+* **Sandbox Enforcement**: `SANDBOX_BACKEND="mock"` is strictly forbidden in production.

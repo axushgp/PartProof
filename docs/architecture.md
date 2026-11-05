@@ -78,7 +78,10 @@ The architecture separates responsibilities across three discrete trust boundari
 
 ### 2.1 Backend Application (`backend/app/`)
 * **`api/`**: REST API endpoints for authentication, task creation, plan inspection, approval/cancellation, SSE event streaming, artifact downloads, and system health status.
-* **`services/inference/`**: Vultr Serverless Inference client using an OpenAI-compatible async interface. Enforces structured JSON output parsing (`TaskPlanSchema`), latency tracking, and error handling.
+* **`services/inference/`**:
+  - `VultrInferenceClient`: High-throughput async client for Vultr Serverless Inference (`https://api.vultrinference.com/v1`). Features bounded exponential backoff retries, rate limit (429) & timeout resilience, automatic fallback model routing (`glm-5.3` -> `glm-5.3-flash`), and token/latency observability. Redacts all authorization headers and credentials from logs.
+  - `TaskPlanner`: Deterministic planning service converting natural-language engineering requests into strictly typed `TaskPlanSchema` objects. Enforces step limits (max 3), `execution_type="python"` restriction, code safety bounds, and artifact path safety.
+  - `prompts.py`: Security-hardened prompt template incorporating prompt injection defense, sandboxing restrictions, and strict JSON output schemas.
 * **`services/policy/`**: Deterministic policy validator. Assesses requested capabilities, enforces maximum memory/CPU quotas, confirms network mode is `none`, and flags tasks requiring explicit user approval.
 * **`services/sandbox/`**: Abstract sandbox architecture with two concrete adapters:
   1. `BaseSandboxAdapter`: Common contract enforcing typed configuration, execution requests, process timeout bounds, and lifecycle cleanup.
