@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: partproof-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-partproof}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-PartProofSecurePostgres2026!}
+      POSTGRES_DB: ${POSTGRES_DB:-partproof_db}
+    ports:
+      # Bound strictly to localhost (127.0.0.1) so it is NEVER exposed publicly
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - partproof_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-partproof} -d ${POSTGRES_DB:-partproof_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  partproof_pgdata:
+    name: partproof_pgdata
