@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field, ConfigDict
-from app.schemas.task import TaskRead, TaskPlanRead
+from app.schemas.task import TaskRead, TaskPlanRead, ApprovalRead
 
 
 class ExecutionStepRead(BaseModel):
@@ -89,7 +89,8 @@ class ExecutionEventRead(BaseModel):
 
 class TaskDetail(BaseModel):
     task: TaskRead
-    plan: Optional[TaskPlanRead]
-    latest_execution: Optional[ExecutionRead]
+    plan: Optional[TaskPlanRead] = None
+    latest_execution: Optional[ExecutionRead] = None
+    latest_approval: Optional[ApprovalRead] = None
     artifacts: List[ArtifactRead] = []
     events: List[ExecutionEventRead] = []

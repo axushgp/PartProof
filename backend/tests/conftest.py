@@ -16,7 +16,16 @@ os.environ["PARTPROOF_ENV"] = "development"
 from app.database.session import Base, get_db
 from app.main import app
 from app.core.security import get_password_hash
-from app.models.entities import User
+from app.models.entities import (
+    Approval,
+    Artifact,
+    Execution,
+    ExecutionEvent,
+    ExecutionStep,
+    Task,
+    TaskPlan,
+    User,
+)
 from app.core.config import settings
 
 test_engine = create_async_engine(
@@ -55,6 +64,12 @@ async def override_get_db():
 
 
 app.dependency_overrides[get_db] = override_get_db
+
+
+@pytest.fixture
+async def db_session():
+    async with TestingSessionLocal() as session:
+        yield session
 
 
 @pytest.fixture

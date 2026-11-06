@@ -46,10 +46,13 @@
     - `SEC-004`: Capability allowlist (`file_read`, `file_write`, `math_computation`, `csv_processing`, `json_processing`, `data_analysis`, `text_processing`, `python_execution`). Explicitly denies dangerous system capabilities (`host_filesystem`, `docker_socket`, `raw_socket`, `ssh_access`, `root_access`, `cloud_api`).
     - `SEC-005`: Source code size bounds (<= 64KB) and binary null-byte injection detection.
     - `SEC-006`: Artifact name safety, path traversal checks, and whitelisted extensions.
-* **Cryptographic Plan Binding**:
+* **Cryptographic Plan Binding & Approval Gate**:
   - Every plan is serialized into canonical JSON and hashed with SHA-256 (`plan_hash`).
   - The plan hash is bound to the `TaskPlan`, the `PolicyEvaluationResult`, the user's `Approval` record (`approved_plan_hash`), and the worker `Execution` record (`plan_hash` and `plan_snapshot`).
-  - If a plan is tampered with between planning, policy review, approval, or execution, the hash check fails immediately.
+  - **Approval-Time Re-evaluation**: At the moment of approval (`POST /api/v1/tasks/{task_id}/approve`), the backend recomputes the SHA-256 hash of `task_plan.plan_json` to detect any database tampering, and runs `DeterministicPolicyEngine.evaluate()` fresh against current security rules. Any discrepancy halts execution immediately with an unprocessable entity or conflict response.
+  - **Rejection Immutability**: If a plan is marked `rejected`, it can never be approved in a subsequent request. Re-submitting an approval for a rejected plan raises `409 Conflict`.
+  - **TOCTOU Elimination**: When an approval is recorded, the full approved plan structure is serialized into `Execution.plan_snapshot` alongside `Execution.plan_hash`. The worker executes strictly against this immutable snapshot, eliminating time-of-check-to-time-of-use exploits.
+  - **Concurrency Protection**: Task row-locking (`with_for_update()`) ensures that parallel approval requests cannot race to queue multiple duplicate executions. Idempotency guarantees safe retries from UI or network dropped connections.
 * **Hardware Quotas**: Enforced via backend policy validation before microVM creation (1 vCPU, 512 MB memory, max 30s default timeout, max 120s limit).
 * **Process Killing**: SDK timeout mechanism kills processes if their deadline elapses, returning exit code 124 and capturing timeout telemetry.
 * **Local Development Safety**: The `MockSandboxAdapter` never executes untrusted code on the Windows host. It uses deterministic fixtures and marks all outputs with `execution_mode="mock"`.

@@ -78,6 +78,8 @@ The architecture separates responsibilities across three discrete trust boundari
 
 ### 2.1 Backend Application (`backend/app/`)
 * **`api/`**: REST API endpoints for authentication, task creation, plan inspection, approval/cancellation, SSE event streaming, artifact downloads, and system health status.
+  - `POST /api/v1/tasks/{task_id}/approve`: Validates user authorization; performs row-level locking (`with_for_update()`); ensures task is in `awaiting_approval` state; verifies cryptographic plan integrity against canonical SHA-256 hash; re-evaluates deterministic security policy; handles idempotent repeats and conflicting decisions; atomically records `Approval`, marks `TaskPlan` and `Task`, creates queued `Execution` snapshot, and records `ExecutionEvent`. Queued executions wait for the persistent background worker (Checkpoint 4C).
+  - `POST /api/v1/tasks/{task_id}/cancel`: Validates user authorization; performs row-level locking; idempotently handles already cancelled tasks; cancels pending plans and queued executions; transitions active executions to `cancel_requested` without falsely claiming processes stopped; rejects terminal tasks with `409 Conflict`.
 * **`services/inference/`**:
   - `VultrInferenceClient`: High-throughput async client for Vultr Serverless Inference (`https://api.vultrinference.com/v1`). Features bounded exponential backoff retries, rate limit (429) & timeout resilience, automatic fallback model routing (`glm-5.3` -> `glm-5.3-flash`), and token/latency observability. Redacts all authorization headers and credentials from logs.
   - `TaskPlanner`: Deterministic planning service converting natural-language engineering requests into strictly typed `TaskPlanSchema` objects. Enforces step limits (max 3), `execution_type="python"` restriction, code safety bounds, and artifact path safety.
@@ -110,3 +112,51 @@ The architecture separates responsibilities across three discrete trust boundari
   - Explicit plan breakdown with permission badges before execution approval.
   - Verifiable execution receipt viewer showing cryptographic hashes and sandbox lifecycle timestamps.
   - Containment demonstration panel showcasing real boundary-enforcement tests.
+
+---
+
+## 2.3 Task, Approval & Execution State Machine
+
+PartProof enforces a strict state machine across the lifecycle of every audit task:
+
+```
+[ User Request ]
+       |
+       v
+   (created) --------> (planning) --------> (awaiting_approval)
+                           |                     |        |
+                           v                     |        | (reject)
+                       (failed)                  |        v
+                                                 |   (rejected) [Terminal]
+                                                 |
+                                     (approve)   |
+                                                 v
+                                             (queued)
+                                                 |
+                                                 v
+                                            (preparing)  <-- Worker Pick-Up (4C)
+                                                 |
+                                                 v
+                                             (running)
+                                                 |
+                                                 v
+                                            (verifying)
+                                                 |
+                                    +------------+------------+
+                                    |                         |
+                                    v                         v
+                               (succeeded)                (failed)
+                               [Terminal]                [Terminal]
+```
+
+### Cancellation Transitions
+* **Pre-Execution** (`created`, `planning`, `awaiting_approval`): Transitions directly to `cancelled`. Any associated plan is marked `approval_status="cancelled"`.
+* **Queued** (`queued`): Transitions task and execution atomically to `cancelled`. The background worker will skip this job.
+* **In-Flight** (`preparing`, `running`, `verifying`): Transitions task and execution to `cancel_requested`. The worker signals cancellation to the sandbox adapter and records the final cancellation state once containment teardown is complete.
+* **Terminal States** (`succeeded`, `failed`, `timed_out`, `rejected`): Cannot be cancelled; requests return `409 Conflict`.
+* **Idempotency**: Repeated cancellation requests on `cancelled` or `cancel_requested` tasks return `200 OK` idempotently.
+
+### Concurrency & Data Integrity
+* **Row-Level Locking**: `SELECT ... FOR UPDATE OF tasks` guarantees mutual exclusion on task state transitions, eliminating race conditions during concurrent approval or cancellation requests.
+* **Cryptographic Binding**: Approval re-computes `compute_plan_hash(plan_json)` and asserts equality against `plan_hash` before recording an approval or queuing an execution.
+* **Plan Snapshot**: The queued `Execution` entity captures an immutable copy of `plan_snapshot` and `plan_hash` at the exact moment of approval, preventing post-approval modifications.

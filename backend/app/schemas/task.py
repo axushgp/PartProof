@@ -41,5 +41,17 @@ class TaskApproveRequest(BaseModel):
     reason: Optional[str] = Field(default=None, description="Optional justification note")
 
 
+class ApprovalRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    task_id: str
+    approved_by: Optional[str] = None
+    approved_plan_hash: Optional[str] = None
+    decision: str
+    reason: Optional[str] = None
+    created_at: datetime
+
+
 class TaskCancelRequest(BaseModel):
     reason: Optional[str] = Field(default="Cancelled by user")

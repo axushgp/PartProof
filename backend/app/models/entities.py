@@ -12,6 +12,7 @@ from sqlalchemy import (
     Text,
     JSON,
     Index,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from app.database.session import Base
@@ -184,6 +185,9 @@ class Artifact(Base):
 
 class Approval(Base):
     __tablename__ = "approvals"
+    __table_args__ = (
+        UniqueConstraint("task_id", "approved_plan_hash", name="uq_approvals_task_plan_hash"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)

@@ -1,5 +1,5 @@
 from app.schemas.plan import PlanStepSchema, TaskPlanSchema, PolicyEvaluationResult
-from app.schemas.task import TaskCreate, TaskRead, TaskPlanRead, TaskApproveRequest, TaskCancelRequest
+from app.schemas.task import TaskCreate, TaskRead, TaskPlanRead, TaskApproveRequest, TaskCancelRequest, ApprovalRead
 from app.schemas.execution import (
     ExecutionRead,
     ExecutionStepRead,
@@ -19,6 +19,7 @@ __all__ = [
     "TaskRead",
     "TaskPlanRead",
     "TaskApproveRequest",
+    "ApprovalRead",
     "TaskCancelRequest",
     "ExecutionRead",
     "ExecutionStepRead",
