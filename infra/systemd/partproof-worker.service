@@ -1,7 +1,7 @@
 [Unit]
 Description=PartProof Background Execution Worker (Vultr Microsandbox)
 After=network.target docker.service partproof-postgres-ready.service
-Wants=partproof-postgres-ready.service
+Requires=partproof-postgres-ready.service
 
 [Service]
 Type=simple

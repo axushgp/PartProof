@@ -36,9 +36,21 @@ class MockSandboxAdapter(BaseSandboxAdapter):
 
     async def create(self) -> str:
         """Simulates microVM provisioning."""
+        self._provision_attempted = True
         if self._is_created:
             return self.config.sandbox_id
-        
+
+        if (
+            getattr(self, "_simulate_provision_timeout", False)
+            or "SIMULATE_PROVISION_TIMEOUT" in self.config.sandbox_id
+        ):
+            await asyncio.sleep(0.3)
+            raise SandboxTimeoutError(
+                "Simulated provisioning deadline exceeded.",
+                task_id=self.config.task_id,
+                execution_id=self.config.execution_id,
+            )
+
         await asyncio.sleep(0.01)
         self._is_created = True
         return self.config.sandbox_id
@@ -57,7 +69,15 @@ class MockSandboxAdapter(BaseSandboxAdapter):
 
         start_time = time.monotonic()
 
-        # 1. Deterministic simulation: Timeout simulation
+        # 1. Deterministic simulation: Source transfer timeout simulation
+        if "SIMULATE_SOURCE_TRANSFER_TIMEOUT" in request.code:
+            raise SandboxTimeoutError(
+                f"Simulated source transfer deadline ({request.timeout_seconds}s) exceeded.",
+                task_id=self.config.task_id,
+                execution_id=self.config.execution_id,
+            )
+
+        # 2. Deterministic simulation: Execution timeout simulation
         if "SIMULATE_TIMEOUT" in request.code or (request.timeout_seconds and request.timeout_seconds < 0.05):
             elapsed = 0.05
             raise SandboxTimeoutError(
@@ -154,6 +174,17 @@ class MockSandboxAdapter(BaseSandboxAdapter):
 
     async def destroy(self) -> str:
         """Simulates microVM destruction and verification."""
+        if (
+            getattr(self, "_simulate_cleanup_timeout", False)
+            or "SIMULATE_CLEANUP_TIMEOUT" in getattr(self._last_request, "code", "")
+        ):
+            await asyncio.sleep(0.3)
+            raise SandboxTimeoutError(
+                "Simulated timeout during sandbox cleanup verification",
+                task_id=self.config.task_id,
+                execution_id=self.config.execution_id,
+            )
+
         if not self._is_created:
             return "verified_destroyed"
 

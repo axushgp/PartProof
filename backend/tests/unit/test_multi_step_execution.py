@@ -235,3 +235,204 @@ async def test_cumulative_overall_execution_deadline():
     # Step 3 must be skipped due to cumulative timeout expiration
     assert res.step_outputs[2].status == "skipped"
     assert res.step_outputs[2].exit_code == -1
+
+
+@pytest.mark.asyncio
+async def test_multi_step_provisioning_timeout():
+    """
+    Verifies that when microVM provisioning times out, execution halts immediately,
+    all steps are marked skipped, and cleanup is executed.
+    """
+    from unittest.mock import patch
+
+    manager = SandboxManager(backend_name="mock")
+
+    steps = [
+        StepExecutionRequest(
+            step_number=1,
+            description="Should not execute due to provision timeout",
+            code="print('Should not run')\n",
+        ),
+    ]
+
+    # Patch adapter create to simulate provisioning exceeding budget
+    async def _slow_create(self_adapter):
+        import asyncio
+        await asyncio.sleep(1.5)
+
+    with patch("app.services.sandbox.mock_adapter.MockSandboxAdapter.create", _slow_create):
+        # Budget is 1.0s, create takes 1.5s -> provisioning timeout
+        res = await manager.execute_steps(
+            task_id="test-task-prov-timeout",
+            execution_id="test-exec-prov-timeout",
+            steps=steps,
+            timeout_seconds=1.0,  # minimum config
+        )
+
+    # If provisioning fails or times out, overall status is timed_out and steps are skipped
+    assert res.status == "timed_out"
+    assert len(res.step_outputs) == 1
+    assert res.step_outputs[0].status == "skipped"
+    assert res.cleanup_status == "verified_destroyed"
+
+
+@pytest.mark.asyncio
+async def test_multi_step_source_transfer_timeout():
+    """
+    Verifies that when guest source transfer times out in execute(),
+    the step is recorded as timed_out and subsequent steps are skipped.
+    """
+    manager = SandboxManager(backend_name="mock")
+
+    steps = [
+        StepExecutionRequest(
+            step_number=1,
+            description="Source transfer times out",
+            code="SIMULATE_SOURCE_TRANSFER_TIMEOUT\n",
+        ),
+        StepExecutionRequest(
+            step_number=2,
+            description="Second step skipped",
+            code="print('skipped')\n",
+        ),
+    ]
+
+    res = await manager.execute_steps(
+        task_id="test-task-transfer-timeout",
+        execution_id="test-exec-transfer-timeout",
+        steps=steps,
+        timeout_seconds=10.0,
+    )
+
+    assert res.status == "timed_out"
+    assert len(res.step_outputs) == 2
+    assert res.step_outputs[0].status == "timed_out"
+    assert res.step_outputs[1].status == "skipped"
+    assert res.cleanup_status == "verified_destroyed"
+
+
+@pytest.mark.asyncio
+async def test_multi_step_execution_timeout():
+    """
+    Verifies that when script execution times out in the microVM,
+    the step is marked timed_out and remaining steps are skipped.
+    """
+    manager = SandboxManager(backend_name="mock")
+
+    steps = [
+        StepExecutionRequest(
+            step_number=1,
+            description="Script execution times out",
+            code="SIMULATE_TIMEOUT\n",
+        ),
+        StepExecutionRequest(
+            step_number=2,
+            description="Subsequent step skipped",
+            code="print('skipped')\n",
+        ),
+    ]
+
+    res = await manager.execute_steps(
+        task_id="test-task-exec-timeout",
+        execution_id="test-exec-exec-timeout",
+        steps=steps,
+        timeout_seconds=10.0,
+    )
+
+    assert res.status == "timed_out"
+    assert len(res.step_outputs) == 2
+    assert res.step_outputs[0].status == "timed_out"
+    assert res.step_outputs[1].status == "skipped"
+    assert res.cleanup_status == "verified_destroyed"
+
+
+@pytest.mark.asyncio
+async def test_multi_step_cleanup_timeout():
+    """
+    Verifies that when microVM cleanup times out during the bounded grace period,
+    cleanup_status is marked 'failed' and execution is not silently abandoned.
+    """
+    from unittest.mock import patch
+
+    manager = SandboxManager(backend_name="mock")
+
+    steps = [
+        StepExecutionRequest(
+            step_number=1,
+            description="Step triggers cleanup timeout",
+            code="SIMULATE_CLEANUP_TIMEOUT\n",
+        ),
+    ]
+
+    # Patch cleanup timeout grace period to a short window
+    with patch("app.core.config.settings.SANDBOX_CLEANUP_TIMEOUT_SECONDS", 0.05):
+        res = await manager.execute_steps(
+            task_id="test-task-clean-timeout",
+            execution_id="test-exec-clean-timeout",
+            steps=steps,
+            timeout_seconds=10.0,
+        )
+
+    assert res.cleanup_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_microsandbox_cancellation_during_provisioning_before_context_manager_assignment():
+    """
+    REGRESSION TEST:
+    If MicroSandbox provisioning is cancelled or times out during Sandbox.create()
+    BEFORE _sandbox_cm is assigned:
+    1. _provision_attempted is True, but _sandbox_cm is None.
+    2. destroy() must NEVER report verified_destroyed without proof.
+    3. If CLI verification fails, destroy() must raise SandboxCleanupError.
+    4. If CLI verification proves absence, destroy() returns verified_destroyed.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from app.services.sandbox.base import SandboxConfig, SandboxCleanupError
+    from app.services.sandbox.microsandbox_adapter import MicrosandboxAdapter
+
+    config = SandboxConfig(
+        sandbox_id="partproof-test-cancel-001",
+        image="python:3.12-slim",
+        cpus=1,
+        memory_mb=512,
+        network="none",
+        timeout_seconds=30,
+        task_id="test-task-cancel",
+        execution_id="test-exec-cancel",
+    )
+    adapter = MicrosandboxAdapter(config)
+
+    # Mock SDK loading and Sandbox.create to simulate cancellation before context manager assignment
+    mock_sandbox_cls = AsyncMock()
+    mock_sandbox_cls.create.side_effect = asyncio.CancelledError("User cancelled during provisioning")
+    mock_network_cls = AsyncMock()
+    mock_network_cls.none.return_value = "none"
+
+    with patch("app.services.sandbox.microsandbox_adapter._load_microsandbox_sdk", return_value=(mock_sandbox_cls, mock_network_cls)), \
+         patch("os.path.exists", return_value=True):
+
+        try:
+            await adapter.create()
+        except asyncio.CancelledError:
+            pass
+
+    # Verify state after partial/cancelled provisioning
+    assert adapter._provision_attempted is True
+    assert adapter._sandbox_cm is None
+    assert adapter._sandbox is None
+    assert adapter._is_created is False
+
+    # Scenario A: CLI verification fails (uncertain cleanup) -> MUST NOT report verified_destroyed!
+    with patch.object(adapter, "_cli_destroy_and_verify", AsyncMock(return_value=(False, "msb rm --force failed with exit code 1: permission denied"))):
+        with pytest.raises(SandboxCleanupError) as exc_info:
+            await adapter.destroy()
+        assert "MicroVM destruction could not be verified" in str(exc_info.value)
+        assert adapter._is_destroyed is False
+
+    # Scenario B: CLI verification succeeds (proven absence via msb ls) -> Reports verified_destroyed
+    with patch.object(adapter, "_cli_destroy_and_verify", AsyncMock(return_value=(True, "MicroVM confirmed absent in msb ls"))):
+        status = await adapter.destroy()
+        assert status == "verified_destroyed"
+        assert adapter._is_destroyed is True

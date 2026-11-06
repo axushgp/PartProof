@@ -415,7 +415,10 @@ class SandboxManager:
                     step_duration = 0.0
 
                     try:
-                        step_exec_out = await adapter.execute(step_req)
+                        step_exec_out = await asyncio.wait_for(
+                            adapter.execute(step_req),
+                            timeout=effective_step_timeout,
+                        )
                         step_duration = step_exec_out.duration_seconds
                         step_stdout = step_exec_out.stdout
                         step_stderr = step_exec_out.stderr
@@ -432,15 +435,16 @@ class SandboxManager:
                             last_exit_code = step_exit_code
                             error_msg = f"Step {step.step_number} failed with exit code {step_exit_code}"
 
-                    except SandboxTimeoutError as te:
+                    except (asyncio.TimeoutError, SandboxTimeoutError) as te:
                         logger.warning(f"Step {step.step_number} timed out: {te}")
                         step_status = "timed_out"
                         overall_status = "timed_out"
                         failed_or_stopped = True
                         last_exit_code = 124
                         step_duration = effective_step_timeout
-                        step_stderr = f"Step timed out: {te.message}\n"
-                        error_msg = f"Step {step.step_number} timed out: {te}"
+                        err_msg_str = getattr(te, "message", str(te))
+                        step_stderr = f"Step timed out: {err_msg_str}\n"
+                        error_msg = f"Step {step.step_number} timed out: {err_msg_str}"
 
                     except Exception as step_err:
                         logger.error(f"Step {step.step_number} encountered error: {step_err}", exc_info=True)

@@ -1000,10 +1000,14 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_rm_and_ls(db_sessio
 async def test_worker_lease_expiry_during_validation_aborts_execution(db_session: AsyncSession):
     """
     Regression test:
-    Worker captures current timestamp immediately before the preparing -> running update.
-    If the worker's lease expires during validation, the atomic CAS update matches 0 rows.
-    Worker must cleanly abort without starting the microVM or executing any steps.
+    Simulates a worker lease expiring during validation (not before validation starts).
+    When validation finishes, the atomic conditional update matches 0 rows due to staleness.
+    Worker must cleanly abort:
+    - worker.sandbox_manager.execute_steps() is never called
+    - No sandbox is provisioned (sandbox_id remains None, status remains preparing)
+    - No execution_started event is written
     """
+    import time
     from unittest.mock import AsyncMock
     from app.workers.execution_worker import ExecutionWorker
     from app.workers.queue import ClaimedExecution
@@ -1029,8 +1033,8 @@ async def test_worker_lease_expiry_during_validation_aborts_execution(db_session
     db_session.add(approval)
     await db_session.flush()
 
-    # Set lease_expires_at to the past so it is already expired when validation finishes
-    expired_lease = datetime.now(timezone.utc) - timedelta(seconds=5)
+    # Lease is ACTIVE when claimed and when pre-execution check begins (expires in 40ms)
+    active_lease = datetime.now(timezone.utc) + timedelta(milliseconds=40)
     execution = Execution(
         task_id=task.id,
         approval_id=approval.id,
@@ -1038,7 +1042,7 @@ async def test_worker_lease_expiry_during_validation_aborts_execution(db_session
         plan_snapshot=plan_dict,
         status="preparing",
         worker_id="worker-val-expired",
-        lease_expires_at=expired_lease,
+        lease_expires_at=active_lease,
         runtime_image="python:3.12-slim",
         cpu_limit=1,
         memory_limit_mb=512,
@@ -1049,7 +1053,17 @@ async def test_worker_lease_expiry_during_validation_aborts_execution(db_session
     await db_session.commit()
 
     worker = ExecutionWorker(session_factory=session_factory, worker_id="worker-val-expired")
-    worker.sandbox_manager.execute_plan = AsyncMock()
+    worker.sandbox_manager.execute_steps = AsyncMock()
+
+    # Simulate validation taking time, during which the lease expires
+    original_validate = worker.validator.validate
+    def validate_with_lease_expiry_delay(exec_arg, app_arg):
+        result = original_validate(exec_arg, app_arg)
+        # Sleep 80ms so lease expires during the validation process
+        time.sleep(0.08)
+        return result
+
+    worker.validator.validate = validate_with_lease_expiry_delay
 
     claimed = ClaimedExecution(
         execution_id=execution.id,
@@ -1068,7 +1082,7 @@ async def test_worker_lease_expiry_during_validation_aborts_execution(db_session
     await worker._process_execution(claimed)
 
     # MicroVM execution must NEVER be launched
-    worker.sandbox_manager.execute_plan.assert_not_called()
+    worker.sandbox_manager.execute_steps.assert_not_called()
 
     # Verify execution state in database was NOT promoted to running or given a sandbox_id
     await db_session.refresh(execution)

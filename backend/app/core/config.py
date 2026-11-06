@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     SANDBOX_DEFAULT_MEMORY_MB: int = Field(default=512)
     SANDBOX_MAX_MEMORY_MB: int = Field(default=1024)
     SANDBOX_DEFAULT_NETWORK: str = Field(default="none")
+    SANDBOX_CLEANUP_TIMEOUT_SECONDS: float = Field(default=15.0)
 
     # Distributed Worker Configuration
     WORKER_ID: str = Field(default_factory=lambda: f"worker-{uuid.uuid4().hex[:8]}")
