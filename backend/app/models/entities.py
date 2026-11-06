@@ -5,6 +5,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -46,7 +47,7 @@ class Task(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     
     # Task Lifecycle State:
-    # created, planning, awaiting_approval, queued, preparing, running, verifying, succeeded, failed, cancel_requested, cancelled, timed_out
+    # created, planning, awaiting_approval, queued, preparing, running, verifying, succeeded, failed, cancel_requested, cancelled, timed_out, rejected
     status: Mapped[str] = mapped_column(String(50), default="created", index=True)
     
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -70,8 +71,13 @@ class TaskPlan(Base):
     # Validated structured JSON plan
     plan_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     
+    # Deterministic cryptographic SHA-256 digest of canonical plan_json
+    plan_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    
     # Deterministic policy engine evaluation
     policy_result: Mapped[dict] = mapped_column(JSON, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(50), default="1.0.0")
+    policy_evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     
     # pending, approved, rejected
     approval_status: Mapped[str] = mapped_column(String(50), default="pending", index=True)
@@ -86,9 +92,15 @@ class Execution(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    approval_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("approvals.id", ondelete="SET NULL"), nullable=True, unique=True, index=True)
+    
+    # Canonical hash and immutable snapshot of the plan approved for this run
+    plan_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    plan_snapshot: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    
     sandbox_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     
-    # queued, preparing, running, verifying, succeeded, failed, timed_out, cancelled
+    # queued, preparing, running, verifying, succeeded, failed, timed_out, cancel_requested, cancelled, needs_reconciliation
     status: Mapped[str] = mapped_column(String(50), default="queued", index=True)
     
     runtime_image: Mapped[str] = mapped_column(String(100), default="python:3.12-slim")
@@ -97,8 +109,15 @@ class Execution(Base):
     network_mode: Mapped[str] = mapped_column(String(50), default="none")
     guest_kernel: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     
+    # Distributed worker execution lease tracking
+    worker_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), default=utc_now)
+    
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     
     # verified_destroyed, leak_detected, pending_cleanup
@@ -108,6 +127,7 @@ class Execution(Base):
     receipt_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     task: Mapped["Task"] = relationship("Task", back_populates="executions")
+    approval: Mapped[Optional["Approval"]] = relationship("Approval", back_populates="execution")
     steps: Mapped[List["ExecutionStep"]] = relationship("ExecutionStep", back_populates="execution", cascade="all, delete-orphan")
     artifacts: Mapped[List["Artifact"]] = relationship("Artifact", back_populates="execution", cascade="all, delete-orphan")
 
@@ -168,8 +188,10 @@ class Approval(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     approved_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    approved_plan_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     decision: Mapped[str] = mapped_column(String(50), nullable=False)  # approved, rejected
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     task: Mapped["Task"] = relationship("Task", back_populates="approvals")
+    execution: Mapped[Optional["Execution"]] = relationship("Execution", back_populates="approval", uselist=False)

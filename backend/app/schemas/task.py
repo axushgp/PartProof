@@ -16,7 +16,10 @@ class TaskPlanRead(BaseModel):
     task_id: str
     model: str
     plan_json: TaskPlanSchema
+    plan_hash: str
     policy_result: PolicyEvaluationResult
+    policy_version: str = "1.0.0"
+    policy_evaluated_at: Optional[datetime] = None
     approval_status: str
     created_at: datetime
 

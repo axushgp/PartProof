@@ -28,7 +28,9 @@ pip install -r requirements.txt
 cp ../.env.example .env
 # Set SANDBOX_BACKEND=mock for local development
 
-# 4. Run database migrations or initialize tables
+# 4. Run database migrations
+alembic upgrade head
+# Or initialize tables directly in development:
 python -m app.database.init_db
 
 # 5. Start the FastAPI development server
@@ -49,7 +51,7 @@ npm run dev
 ## 2. Running Automated Tests
 
 ### Unit Tests (Local Windows / macOS / Linux)
-Runs all core unit tests, including authentication, health checks, mock sandbox adapter, artifact manager, policy validation, Vultr inference client, task planner, and task planning APIs:
+Runs all core unit tests, including authentication, health checks, mock sandbox adapter, artifact manager, plan integrity hashing, deterministic policy engine, Vultr inference client, task planner, and task planning APIs:
 ```bash
 # In backend virtual environment:
 pytest backend/tests/unit backend/tests/test_health_and_auth.py -v

@@ -12,27 +12,10 @@ from app.schemas.task import TaskCreate, TaskPlanRead, TaskRead
 from app.schemas.execution import TaskDetail
 from app.services.inference.exceptions import InferenceError, TaskPlanningError
 from app.services.inference.planner import TaskPlanner
+from app.services.orchestration.plan_integrity import compute_plan_hash
+from app.services.policy.engine import DeterministicPolicyEngine
 
 router = APIRouter()
-
-
-def evaluate_default_policy(plan: TaskPlanSchema) -> PolicyEvaluationResult:
-    """
-    Evaluates baseline policy parameters for a validated task plan.
-    Enforces blast radius zero invariants: network mode none, approval mandatory.
-    """
-    return PolicyEvaluationResult(
-        allowed=True,
-        policy_name="blast_radius_zero_strict",
-        image="python:3.12-slim",
-        cpu_limit=1,
-        memory_limit_mb=512,
-        timeout_seconds=30,
-        network_mode="none",
-        approval_required=True,
-        reasons=["Standard isolated Python microVM execution profile applied."],
-        violations=[],
-    )
 
 
 @router.post("", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
@@ -60,8 +43,10 @@ async def create_and_plan_task(
     try:
         plan_schema, metadata = await planner.plan_task(payload.description)
         
-        # Apply deterministic initial policy evaluation
-        policy_res = evaluate_default_policy(plan_schema)
+        # Apply deterministic policy engine evaluation
+        policy_engine = DeterministicPolicyEngine()
+        policy_res = policy_engine.evaluate(plan_schema)
+        plan_hash = policy_res.plan_hash or compute_plan_hash(plan_schema)
 
         # Update task title from plan if not explicitly supplied
         if not payload.title:
@@ -70,12 +55,15 @@ async def create_and_plan_task(
         task_plan = TaskPlan(
             task_id=task.id,
             model=metadata.model,
-            plan_json=plan_schema.model_dump(),
-            policy_result=policy_res.model_dump(),
-            approval_status="pending",
+            plan_json=plan_schema.model_dump(mode="json"),
+            plan_hash=plan_hash,
+            policy_result=policy_res.model_dump(mode="json"),
+            policy_version=policy_res.policy_version,
+            policy_evaluated_at=policy_res.evaluated_at,
+            approval_status="pending" if policy_res.allowed else "rejected",
         )
         db.add(task_plan)
-        task.status = "awaiting_approval"
+        task.status = "awaiting_approval" if policy_res.allowed else "failed"
 
         await db.commit()
         await db.refresh(task)
@@ -135,25 +123,33 @@ async def generate_or_regenerate_plan(
 
     try:
         plan_schema, metadata = await planner.plan_task(task.description)
-        policy_res = evaluate_default_policy(plan_schema)
+        policy_engine = DeterministicPolicyEngine()
+        policy_res = policy_engine.evaluate(plan_schema)
+        plan_hash = policy_res.plan_hash or compute_plan_hash(plan_schema)
 
         if task.plan:
             task.plan.model = metadata.model
-            task.plan.plan_json = plan_schema.model_dump()
-            task.plan.policy_result = policy_res.model_dump()
-            task.plan.approval_status = "pending"
+            task.plan.plan_json = plan_schema.model_dump(mode="json")
+            task.plan.plan_hash = plan_hash
+            task.plan.policy_result = policy_res.model_dump(mode="json")
+            task.plan.policy_version = policy_res.policy_version
+            task.plan.policy_evaluated_at = policy_res.evaluated_at
+            task.plan.approval_status = "pending" if policy_res.allowed else "rejected"
             task_plan = task.plan
         else:
             task_plan = TaskPlan(
                 task_id=task.id,
                 model=metadata.model,
-                plan_json=plan_schema.model_dump(),
-                policy_result=policy_res.model_dump(),
-                approval_status="pending",
+                plan_json=plan_schema.model_dump(mode="json"),
+                plan_hash=plan_hash,
+                policy_result=policy_res.model_dump(mode="json"),
+                policy_version=policy_res.policy_version,
+                policy_evaluated_at=policy_res.evaluated_at,
+                approval_status="pending" if policy_res.allowed else "rejected",
             )
             db.add(task_plan)
 
-        task.status = "awaiting_approval"
+        task.status = "awaiting_approval" if policy_res.allowed else "failed"
         await db.commit()
         await db.refresh(task_plan)
         return TaskPlanRead.model_validate(task_plan)

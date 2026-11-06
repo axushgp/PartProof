@@ -82,7 +82,17 @@ The architecture separates responsibilities across three discrete trust boundari
   - `VultrInferenceClient`: High-throughput async client for Vultr Serverless Inference (`https://api.vultrinference.com/v1`). Features bounded exponential backoff retries, rate limit (429) & timeout resilience, automatic fallback model routing (`glm-5.3` -> `glm-5.3-flash`), and token/latency observability. Redacts all authorization headers and credentials from logs.
   - `TaskPlanner`: Deterministic planning service converting natural-language engineering requests into strictly typed `TaskPlanSchema` objects. Enforces step limits (max 3), `execution_type="python"` restriction, code safety bounds, and artifact path safety.
   - `prompts.py`: Security-hardened prompt template incorporating prompt injection defense, sandboxing restrictions, and strict JSON output schemas.
-* **`services/policy/`**: Deterministic policy validator. Assesses requested capabilities, enforces maximum memory/CPU quotas, confirms network mode is `none`, and flags tasks requiring explicit user approval.
+* **`services/orchestration/`**:
+  - `plan_integrity.py`: Cryptographic plan hashing. Computes canonical JSON serialization (key-sorted, compact delimiters, UTF-8 encoded) and SHA-256 digest (`plan_hash`). Ensures that any modification to plan steps, source code, capabilities, network mode, or artifacts changes the plan hash, guaranteeing tamper-evident binding across planning, policy evaluation, approval, and worker execution.
+* **`services/policy/`**:
+  - `DeterministicPolicyEngine`: Independent, non-LLM security enforcement engine (`blast_radius_zero_strict` v1.0.0). Validates proposed plans against 6 hard boundary rules:
+    1. `SEC-001 (PermittedExecutionType)`: Strictly permits `execution_type="python"` only.
+    2. `SEC-002 (StepCountBounds)`: Enforces non-empty step count within `settings.MAX_PLAN_STEPS` (default: 3).
+    3. `SEC-003 (ZeroNetworkEnforcement)`: Strictly rejects plans requesting outbound network access (`network_required=True`).
+    4. `SEC-004 (CapabilityAllowlist)`: Restricts requested capabilities to safe allowlist (`python_execution`, `math_computation`, `file_read`, `file_write`, `csv_processing`, `json_processing`, `data_analysis`, `text_processing`). Rejects forbidden capabilities (`host_filesystem`, `docker_socket`, `raw_socket`, `privileged_execution`, etc.).
+    5. `SEC-005 (SourceCodeBounds)`: Enforces size limits (`MAX_SOURCE_INPUT_BYTES`) and checks for illegal control bytes (null bytes).
+    6. `SEC-006 (ArtifactSafety)`: Validates filenames against path traversal, directory separators, hidden dotfiles, allowed extensions (`.csv`, `.json`, `.txt`, `.log`, `.md`, `.pdf`, `.png`, `.jpg`, `.jpeg`, `.tsv`, `.html`), and batch count limits.
+  - Generates immutable `PolicyEvaluationResult` bound to the canonical `plan_hash`.
 * **`services/sandbox/`**: Abstract sandbox architecture with two concrete adapters:
   1. `BaseSandboxAdapter`: Common contract enforcing typed configuration, execution requests, process timeout bounds, and lifecycle cleanup.
   2. `MockSandboxAdapter`: Deterministic local development adapter for Windows/macOS. Explicitly marked with `execution_mode="mock"`. Never executes untrusted code on the host OS.

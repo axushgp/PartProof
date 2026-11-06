@@ -36,6 +36,20 @@
 ---
 
 ## 4. Execution Policy & Timeout Controls
+* **Deterministic Policy Engine (`DeterministicPolicyEngine`)**:
+  - Independent security gate enforcing system invariants regardless of LLM generation.
+  - Policy version: `blast_radius_zero_strict` v1.0.0.
+  - Rules enforced:
+    - `SEC-001`: Python runtime only; blocks shells or unmanaged interpreters.
+    - `SEC-002`: Bounded step counts (1 to 3 steps).
+    - `SEC-003`: Hard zero network (`Network.none()`), rejecting outbound network requests.
+    - `SEC-004`: Capability allowlist (`file_read`, `file_write`, `math_computation`, `csv_processing`, `json_processing`, `data_analysis`, `text_processing`, `python_execution`). Explicitly denies dangerous system capabilities (`host_filesystem`, `docker_socket`, `raw_socket`, `ssh_access`, `root_access`, `cloud_api`).
+    - `SEC-005`: Source code size bounds (<= 64KB) and binary null-byte injection detection.
+    - `SEC-006`: Artifact name safety, path traversal checks, and whitelisted extensions.
+* **Cryptographic Plan Binding**:
+  - Every plan is serialized into canonical JSON and hashed with SHA-256 (`plan_hash`).
+  - The plan hash is bound to the `TaskPlan`, the `PolicyEvaluationResult`, the user's `Approval` record (`approved_plan_hash`), and the worker `Execution` record (`plan_hash` and `plan_snapshot`).
+  - If a plan is tampered with between planning, policy review, approval, or execution, the hash check fails immediately.
 * **Hardware Quotas**: Enforced via backend policy validation before microVM creation (1 vCPU, 512 MB memory, max 30s default timeout, max 120s limit).
 * **Process Killing**: SDK timeout mechanism kills processes if their deadline elapses, returning exit code 124 and capturing timeout telemetry.
 * **Local Development Safety**: The `MockSandboxAdapter` never executes untrusted code on the Windows host. It uses deterministic fixtures and marks all outputs with `execution_mode="mock"`.
