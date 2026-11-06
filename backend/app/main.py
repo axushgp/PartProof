@@ -6,6 +6,7 @@ from app.api.v1.router import api_router
 from app.core.config import settings
 from app.database.init_db import init_db
 from app.database.session import engine
+from app.services.inference.vultr_client import VultrInferenceClient
 
 logging.basicConfig(
     level=logging.INFO if not settings.DEBUG else logging.DEBUG,
@@ -29,10 +30,17 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize database: {e}", exc_info=True)
         raise e
 
+    # 3. Initialize shared Vultr inference client
+    app.state.inference_client = VultrInferenceClient()
+    logger.info("Shared Vultr inference client initialized.")
+
     yield
 
     # Shutdown
     logger.info("Shutting down PartProof Backend Service...")
+    if hasattr(app.state, "inference_client") and app.state.inference_client is not None:
+        await app.state.inference_client.close()
+        logger.info("Shared Vultr inference client closed.")
     await engine.dispose()
     logger.info("Database connections closed.")
 

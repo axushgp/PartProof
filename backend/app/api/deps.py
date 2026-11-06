@@ -1,11 +1,13 @@
-from typing import Optional
-from fastapi import Depends, HTTPException, status
+from typing import AsyncGenerator, Optional
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decode_access_token
 from app.database.session import get_db
 from app.models.entities import User
+from app.services.inference.planner import TaskPlanner
+from app.services.inference.vultr_client import VultrInferenceClient
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
@@ -40,3 +42,27 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+async def get_inference_client(request: Request) -> AsyncGenerator[VultrInferenceClient, None]:
+    """
+    Provides the application-shared VultrInferenceClient if initialized by app lifespan.
+    Otherwise, provisions a per-request client and deterministically closes it in finally.
+    Ensures no HTTP connection leaks and avoids unhandled event loop termination warnings.
+    """
+    shared_client = getattr(request.app.state, "inference_client", None)
+    if shared_client is not None:
+        yield shared_client
+    else:
+        per_request_client = VultrInferenceClient()
+        try:
+            yield per_request_client
+        finally:
+            await per_request_client.close()
+
+
+async def get_task_planner(
+    client: VultrInferenceClient = Depends(get_inference_client),
+) -> TaskPlanner:
+    """Provides a TaskPlanner instance wired to the active inference client."""
+    return TaskPlanner(client=client)

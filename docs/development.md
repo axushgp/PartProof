@@ -65,10 +65,24 @@ RUN_MICROSANDBOX_INTEGRATION=1 pytest backend/tests/integration/test_microsandbo
 ```
 
 ### Live Vultr Serverless Inference Integration Test
-The live inference test (`tests/integration/test_vultr_inference_real.py`) tests direct connectivity to `https://api.vultrinference.com/v1`, requests a structured plan using `glm-5.3`, validates schema compliance, and verifies token/latency metadata:
+The live inference test (`tests/integration/test_vultr_inference_real.py`) tests direct connectivity to `https://api.vultrinference.com/v1`, requests a structured plan using `glm-5.3`, validates schema compliance, and verifies token/latency metadata. Clients are managed via asynchronous context managers (`async with VultrInferenceClient()`) to ensure deterministic closure before the event loop terminates:
 ```bash
 # On Vultr VM or with VULTR_INFERENCE_API_KEY configured:
 VULTR_INFERENCE_API_KEY="your-key" RUN_VULTR_INFERENCE_INTEGRATION=1 pytest backend/tests/integration/test_vultr_inference_real.py -v
+```
+
+### Isolated PostgreSQL Concurrency Integration Test
+The PostgreSQL concurrency test (`tests/integration/test_postgres_concurrency.py`) verifies pessimistic row-level locking (`SELECT ... FOR UPDATE OF tasks`), idempotent duplicate approval handling, and rejection immutability against a real PostgreSQL instance:
+* **Dedicated Test DB**: Requires `TEST_POSTGRES_DATABASE_URL` pointing to a database containing `test` (e.g. `partproof_test`). Targeting production `partproof_db` triggers an immediate safety failure.
+* **Schema Provisioning**: Automatically executes actual Alembic migrations (`alembic upgrade head`) against the test database before test execution.
+* **Session Isolation**: Dynamically overrides FastAPI's `get_db` dependency with an isolated async PostgreSQL session factory and restores original overrides after test completion.
+* **Zero Production Secret Leakage**: Dynamically provisions isolated test users and JWT tokens; planning tests use local test doubles without calling live LLMs.
+
+```bash
+# Run PostgreSQL concurrency integration test (requires running PostgreSQL test DB):
+TEST_POSTGRES_DATABASE_URL="postgresql+asyncpg://linuxuser:secret@localhost:5432/partproof_test" \
+RUN_POSTGRES_TESTS=1 \
+pytest backend/tests/integration/test_postgres_concurrency.py -v
 ```
 
 ---

@@ -17,13 +17,14 @@ pytestmark = pytest.mark.skipif(
 async def test_live_vultr_inference_health():
     """
     Verifies live connectivity and authentication with Vultr Serverless Inference endpoint.
+    Uses context manager for deterministic client closure before event loop termination.
     """
-    client = VultrInferenceClient()
-    health = await client.check_health()
+    async with VultrInferenceClient() as client:
+        health = await client.check_health()
 
-    assert health.status == "reachable", f"Vultr inference health check failed: {health.message}"
-    assert health.latency_ms is not None
-    assert health.latency_ms > 0
+        assert health.status == "reachable", f"Vultr inference health check failed: {health.message}"
+        assert health.latency_ms is not None
+        assert health.latency_ms > 0
 
 
 @pytest.mark.asyncio
@@ -35,34 +36,34 @@ async def test_live_vultr_task_planning_glm():
     3. Receives GLM-5.3 completion.
     4. Parses JSON and verifies full Pydantic TaskPlanSchema compliance.
     5. Verifies token usage and latency telemetry.
+    Uses async context managers for clean HTTP client teardown.
     """
-    client = VultrInferenceClient()
-    planner = TaskPlanner(client=client)
+    async with VultrInferenceClient() as client:
+        async with TaskPlanner(client=client) as planner:
+            task_description = (
+                "Generate a Python program that calculates the first 10 prime numbers "
+                "and writes them into a CSV file named '/workspace/output/primes.csv'."
+            )
 
-    task_description = (
-        "Generate a Python program that calculates the first 10 prime numbers "
-        "and writes them into a CSV file named '/workspace/output/primes.csv'."
-    )
+            plan, metadata = await planner.plan_task(task_description)
 
-    plan, metadata = await planner.plan_task(task_description)
+            # 1. Schema validation
+            assert isinstance(plan, TaskPlanSchema)
+            assert len(plan.title) > 0
+            assert len(plan.steps) >= 1
+            assert len(plan.steps) <= 3
 
-    # 1. Schema validation
-    assert isinstance(plan, TaskPlanSchema)
-    assert len(plan.title) > 0
-    assert len(plan.steps) >= 1
-    assert len(plan.steps) <= 3
+            # 2. Step safety validation
+            for step in plan.steps:
+                assert step.execution_type == "python"
+                assert len(step.code.strip()) > 0
+                assert "def " in step.code or "print" in step.code or "with open" in step.code or "for " in step.code
 
-    # 2. Step safety validation
-    for step in plan.steps:
-        assert step.execution_type == "python"
-        assert len(step.code.strip()) > 0
-        assert "def " in step.code or "print" in step.code or "with open" in step.code or "for " in step.code
+            # 3. Artifact specification
+            assert "primes.csv" in plan.expected_artifacts or any(a.endswith(".csv") for a in plan.expected_artifacts)
 
-    # 3. Artifact specification
-    assert "primes.csv" in plan.expected_artifacts or any(a.endswith(".csv") for a in plan.expected_artifacts)
-
-    # 4. Metadata verification
-    assert metadata.provider == "vultr"
-    assert metadata.model in [settings.VULTR_INFERENCE_MODEL, settings.VULTR_INFERENCE_FALLBACK_MODEL]
-    assert metadata.latency_ms > 0
-    assert metadata.total_tokens is not None and metadata.total_tokens > 0
+            # 4. Metadata verification
+            assert metadata.provider == "vultr"
+            assert metadata.model in [settings.VULTR_INFERENCE_MODEL, settings.VULTR_INFERENCE_FALLBACK_MODEL]
+            assert metadata.latency_ms > 0
+            assert metadata.total_tokens is not None and metadata.total_tokens > 0

@@ -25,9 +25,25 @@ class TaskPlanner:
         artifact_manager: Optional[ArtifactManager] = None,
         max_steps: Optional[int] = None,
     ):
+        self._owns_client = client is None
         self.client = client or VultrInferenceClient()
         self.artifact_manager = artifact_manager or ArtifactManager()
         self.max_steps = max_steps or settings.MAX_PLAN_STEPS
+
+    async def close(self) -> None:
+        """Closes the underlying client if owned by this planner."""
+        if self._owns_client and self.client is not None:
+            await self.client.close()
+
+    async def aclose(self) -> None:
+        """Alias for close()."""
+        await self.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
     def _clean_json_content(self, raw_content: str) -> str:
         """Strips markdown code fences and extraneous whitespace if present."""

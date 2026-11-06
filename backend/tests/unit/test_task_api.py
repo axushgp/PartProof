@@ -1,7 +1,10 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
+from app.models.entities import Approval, Execution, Task, TaskPlan
 from app.schemas.plan import TaskPlanSchema
 from app.services.inference.base import InferenceMetadata
 
@@ -138,3 +141,175 @@ async def test_task_not_found_returns_404(client: AsyncClient):
 
     resp = await client.get("/api/v1/tasks/nonexistent-task-id", headers=headers)
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_plan_regeneration_prohibited_when_approved_or_queued(client: AsyncClient):
+    """Regeneration must be rejected with 409 once a plan has been approved and queued."""
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        new=AsyncMock(return_value=(MOCK_VALID_PLAN, MOCK_METADATA)),
+    ):
+        create_resp = await client.post(
+            "/api/v1/tasks",
+            json={"description": "Original task description"},
+            headers=headers,
+        )
+        task_id = create_resp.json()["task"]["id"]
+
+    # Approve task
+    approve_resp = await client.post(
+        f"/api/v1/tasks/{task_id}/approve",
+        json={"decision": "approved"},
+        headers=headers,
+    )
+    assert approve_resp.status_code == 200
+    assert approve_resp.json()["task"]["status"] == "queued"
+
+    # Attempt to regenerate plan after approval
+    regen_resp = await client.post(
+        f"/api/v1/tasks/{task_id}/plan",
+        headers=headers,
+    )
+    assert regen_resp.status_code == 409
+    assert "already been approved" in regen_resp.json()["detail"].lower() or "execution" in regen_resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_plan_regeneration_prohibited_when_in_flight_or_terminal(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Regeneration must be rejected when task is running, succeeded, or cancelled."""
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    non_plannable_states = ["running", "succeeded", "cancelled"]
+
+    for st in non_plannable_states:
+        with patch(
+            "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+            new=AsyncMock(return_value=(MOCK_VALID_PLAN, MOCK_METADATA)),
+        ):
+            create_resp = await client.post(
+                "/api/v1/tasks",
+                json={"description": f"Test task for state {st}"},
+                headers=headers,
+            )
+            task_id = create_resp.json()["task"]["id"]
+
+        # Mutate task to non-plannable status
+        t = await db_session.get(Task, task_id)
+        t.status = st
+        await db_session.commit()
+
+        # Attempt regeneration
+        regen_resp = await client.post(f"/api/v1/tasks/{task_id}/plan", headers=headers)
+        assert regen_resp.status_code == 409
+        assert "cannot regenerate plan" in regen_resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_plan_regeneration_allowed_after_rejection(client: AsyncClient, db_session: AsyncSession):
+    """
+    When a plan is rejected, regeneration is explicitly permitted.
+    The new plan receives a new canonical hash and returns task to awaiting_approval,
+    while prior rejection records in Approval are safely preserved.
+    """
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        new=AsyncMock(return_value=(MOCK_VALID_PLAN, MOCK_METADATA)),
+    ):
+        create_resp = await client.post(
+            "/api/v1/tasks",
+            json={"description": "Task to be rejected and replanned"},
+            headers=headers,
+        )
+        task_id = create_resp.json()["task"]["id"]
+
+    # Reject the initial plan
+    reject_resp = await client.post(
+        f"/api/v1/tasks/{task_id}/approve",
+        json={"decision": "rejected", "reason": "Auditor rejected initial approach"},
+        headers=headers,
+    )
+    assert reject_resp.status_code == 200
+    assert reject_resp.json()["task"]["status"] == "rejected"
+    assert reject_resp.json()["plan"]["approval_status"] == "rejected"
+
+    # Regenerate with a new revised plan
+    revised_plan = MOCK_VALID_PLAN.model_copy()
+    revised_plan.title = "Revised Audit Approach After Rejection"
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        new=AsyncMock(return_value=(revised_plan, MOCK_METADATA)),
+    ):
+        regen_resp = await client.post(f"/api/v1/tasks/{task_id}/plan", headers=headers)
+        assert regen_resp.status_code == 200
+        new_plan = regen_resp.json()
+        assert new_plan["plan_json"]["title"] == "Revised Audit Approach After Rejection"
+        assert new_plan["approval_status"] == "pending"
+
+    # Verify task state is now awaiting_approval
+    detail_resp = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["task"]["status"] == "awaiting_approval"
+
+    # Verify original rejection Approval record remains preserved in PostgreSQL/SQLite
+    appr_res = await db_session.execute(select(Approval).where(Approval.task_id == task_id))
+    approvals = appr_res.scalars().all()
+    assert len(approvals) == 1
+    assert approvals[0].decision == "rejected"
+    assert approvals[0].reason == "Auditor rejected initial approach"
+
+
+@pytest.mark.asyncio
+async def test_plan_regeneration_rejected_when_already_planning(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """If a task is already undergoing planning, concurrent regeneration returns 409 Conflict."""
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        new=AsyncMock(return_value=(MOCK_VALID_PLAN, MOCK_METADATA)),
+    ):
+        create_resp = await client.post(
+            "/api/v1/tasks",
+            json={"description": "Task for concurrent planning test"},
+            headers=headers,
+        )
+        task_id = create_resp.json()["task"]["id"]
+
+    # Manually mark task as planning
+    t = await db_session.get(Task, task_id)
+    t.status = "planning"
+    await db_session.commit()
+
+    # Attempt regeneration
+    regen_resp = await client.post(f"/api/v1/tasks/{task_id}/plan", headers=headers)
+    assert regen_resp.status_code == 409
+    assert "currently undergoing planning" in regen_resp.json()["detail"].lower()

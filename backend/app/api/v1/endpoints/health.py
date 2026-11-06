@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.api.deps import get_inference_client
 from app.core.config import settings
 from app.database.session import get_db
 from app.schemas.system import HealthResponse, SystemStatus
@@ -62,10 +63,12 @@ async def system_status(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/system/inference", response_model=ProviderHealth)
-async def check_inference_provider():
+async def check_inference_provider(
+    client: VultrInferenceClient = Depends(get_inference_client),
+):
     """
     Explicit connectivity check for Vultr Serverless Inference.
     Does not issue completion requests; verifies authentication and endpoint reachability.
+    Uses the managed inference client to prevent HTTP connection leaks.
     """
-    client = VultrInferenceClient()
     return await client.check_health()

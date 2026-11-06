@@ -41,9 +41,12 @@ class VultrInferenceClient:
         self.max_retries = max_retries if max_retries is not None else settings.VULTR_INFERENCE_MAX_RETRIES
 
         self._client: Optional[AsyncOpenAI] = None
+        self._closed: bool = False
 
     def _get_client(self) -> AsyncOpenAI:
         """Initializes and returns the AsyncOpenAI client instance."""
+        if self._closed:
+            raise InferenceError("VultrInferenceClient has been closed.")
         if not self.api_key:
             raise InferenceConfigurationError(
                 "VULTR_INFERENCE_API_KEY is not configured on the backend."
@@ -55,6 +58,30 @@ class VultrInferenceClient:
                 timeout=self.timeout,
             )
         return self._client
+
+    async def close(self) -> None:
+        """
+        Explicitly closes the AsyncOpenAI client and its underlying httpx connection pool.
+        Ensures HTTP connections are freed and no unclosed client warnings occur.
+        """
+        self._closed = True
+        if self._client is not None:
+            client = self._client
+            self._client = None
+            try:
+                await client.close()
+            except Exception as e:
+                logger.warning(f"Error closing AsyncOpenAI client: {e}")
+
+    async def aclose(self) -> None:
+        """Alias for close() to match httpx / async context convention."""
+        await self.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
     async def chat_completion(
         self,

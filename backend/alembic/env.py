@@ -26,8 +26,9 @@ from app.models.entities import (
 
 config = context.config
 
-# Dynamically set sqlalchemy.url from PartProof settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Dynamically set sqlalchemy.url from ALEMBIC_DATABASE_URL or PartProof settings
+alembic_db_url = os.environ.get("ALEMBIC_DATABASE_URL") or os.environ.get("DATABASE_URL") or settings.DATABASE_URL
+config.set_main_option("sqlalchemy.url", alembic_db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

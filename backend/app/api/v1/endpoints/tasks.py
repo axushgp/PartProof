@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_task_planner
 from app.core.config import settings
 from app.database.session import get_db
 from app.models.entities import Approval, Execution, ExecutionEvent, Task, TaskPlan, User
@@ -95,6 +95,7 @@ async def create_and_plan_task(
     payload: TaskCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    planner: TaskPlanner = Depends(get_task_planner),
 ):
     """
     Creates a new task and generates an AI execution plan via Vultr Serverless Inference.
@@ -109,8 +110,6 @@ async def create_and_plan_task(
     db.add(task)
     await db.commit()
     await db.refresh(task)
-
-    planner = TaskPlanner()
 
     try:
         plan_schema, metadata = await planner.plan_task(payload.description)
@@ -172,12 +171,28 @@ async def generate_or_regenerate_plan(
     task_id: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    planner: TaskPlanner = Depends(get_task_planner),
 ):
     """
     Generates or regenerates an AI execution plan for an existing task.
+    Enforces pessimistic row-locking and strict state validation:
+    - Rejects regeneration if task plan has already been approved (approval_status == 'approved')
+    - Rejects regeneration if task has queued, active, or completed executions
+    - Rejects regeneration if task is currently undergoing planning
+    - Rejects regeneration if task is in non-plannable states (queued, running, succeeded, etc.)
+    - Preserves prior approval records and immutable execution snapshots
+    - Permits regeneration after plan rejection, producing a fresh canonical plan hash
     """
+    # 1. Acquire pessimistic lock on Task row
     result = await db.execute(
-        select(Task).where(Task.id == task_id).options(selectinload(Task.plan))
+        select(Task)
+        .where(Task.id == task_id)
+        .options(
+            selectinload(Task.plan),
+            selectinload(Task.executions),
+            selectinload(Task.approvals),
+        )
+        .with_for_update(of=Task)
     )
     task = result.scalar_one_or_none()
 
@@ -188,51 +203,104 @@ async def generate_or_regenerate_plan(
     if task.user_id != current_user.id and current_user.role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
+    # 2. Strict State Validation
+    if task.plan and task.plan.approval_status == "approved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot regenerate plan: plan has already been approved.",
+        )
+
+    if task.executions:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot regenerate plan: task already has {len(task.executions)} execution record(s).",
+        )
+
+    if task.status in ["queued", "preparing", "running", "verifying", "succeeded", "timed_out", "cancelled", "cancel_requested"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot regenerate plan: task is in non-plannable status '{task.status}'.",
+        )
+
+    if task.status == "planning":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot regenerate plan: task is currently undergoing planning.",
+        )
+
+    # Transition to planning and commit to release lock during inference
     task.status = "planning"
     await db.commit()
 
-    planner = TaskPlanner()
-
+    # 3. AI Planning Call
     try:
         plan_schema, metadata = await planner.plan_task(task.description)
         policy_engine = DeterministicPolicyEngine()
         policy_res = policy_engine.evaluate(plan_schema)
         plan_hash = policy_res.plan_hash or compute_plan_hash(plan_schema)
-
-        if task.plan:
-            task.plan.model = metadata.model
-            task.plan.plan_json = plan_schema.model_dump(mode="json")
-            task.plan.plan_hash = plan_hash
-            task.plan.policy_result = policy_res.model_dump(mode="json")
-            task.plan.policy_version = policy_res.policy_version
-            task.plan.policy_evaluated_at = policy_res.evaluated_at
-            task.plan.approval_status = "pending" if policy_res.allowed else "rejected"
-            task_plan = task.plan
-        else:
-            task_plan = TaskPlan(
-                task_id=task.id,
-                model=metadata.model,
-                plan_json=plan_schema.model_dump(mode="json"),
-                plan_hash=plan_hash,
-                policy_result=policy_res.model_dump(mode="json"),
-                policy_version=policy_res.policy_version,
-                policy_evaluated_at=policy_res.evaluated_at,
-                approval_status="pending" if policy_res.allowed else "rejected",
-            )
-            db.add(task_plan)
-
-        task.status = "awaiting_approval" if policy_res.allowed else "failed"
-        await db.commit()
-        await db.refresh(task_plan)
-        return TaskPlanRead.model_validate(task_plan)
-
     except Exception as e:
-        task.status = "failed"
-        await db.commit()
+        # Re-lock task to record failed state if not cancelled
+        res = await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update(of=Task)
+        )
+        t_locked = res.scalar_one_or_none()
+        if t_locked and t_locked.status != "cancelled":
+            t_locked.status = "failed"
+            await db.commit()
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY if isinstance(e, InferenceError) else status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Plan generation failed: {str(e)}",
         )
+
+    # 4. Re-acquire lock to atomically update Task and TaskPlan
+    res = await db.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .options(selectinload(Task.plan))
+        .with_for_update(of=Task)
+    )
+    task_locked = res.scalar_one()
+
+    if task_locked.status == "cancelled":
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Task was cancelled while plan generation was in progress.",
+        )
+
+    if task_locked.status not in ["planning", "awaiting_approval", "rejected", "failed"]:
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Task transitioned to unexpected state '{task_locked.status}' during planning.",
+        )
+
+    if task_locked.plan:
+        task_locked.plan.model = metadata.model
+        task_locked.plan.plan_json = plan_schema.model_dump(mode="json")
+        task_locked.plan.plan_hash = plan_hash
+        task_locked.plan.policy_result = policy_res.model_dump(mode="json")
+        task_locked.plan.policy_version = policy_res.policy_version
+        task_locked.plan.policy_evaluated_at = policy_res.evaluated_at
+        task_locked.plan.approval_status = "pending" if policy_res.allowed else "rejected"
+        task_plan = task_locked.plan
+    else:
+        task_plan = TaskPlan(
+            task_id=task_locked.id,
+            model=metadata.model,
+            plan_json=plan_schema.model_dump(mode="json"),
+            plan_hash=plan_hash,
+            policy_result=policy_res.model_dump(mode="json"),
+            policy_version=policy_res.policy_version,
+            policy_evaluated_at=policy_res.evaluated_at,
+            approval_status="pending" if policy_res.allowed else "rejected",
+        )
+        db.add(task_plan)
+
+    task_locked.status = "awaiting_approval" if policy_res.allowed else "failed"
+    await db.commit()
+    await db.refresh(task_plan)
+    return TaskPlanRead.model_validate(task_plan)
 
 
 @router.get("/{task_id}/plan", response_model=TaskPlanRead)
