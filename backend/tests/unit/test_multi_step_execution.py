@@ -388,7 +388,7 @@ async def test_microsandbox_cancellation_during_provisioning_before_context_mana
     4. If CLI verification proves absence, destroy() returns verified_destroyed.
     """
     import asyncio
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import AsyncMock, MagicMock, patch
     from app.services.sandbox.base import SandboxConfig, SandboxCleanupError
     from app.services.sandbox.microsandbox_adapter import MicrosandboxAdapter
 
@@ -436,3 +436,196 @@ async def test_microsandbox_cancellation_during_provisioning_before_context_mana
         status = await adapter.destroy()
         assert status == "verified_destroyed"
         assert adapter._is_destroyed is True
+
+
+@pytest.mark.asyncio
+async def test_subprocess_safe_timeout_termination_and_reaping():
+    """
+    Verifies that run_subprocess_safe:
+    1. Binds execution by the specified timeout.
+    2. Explicitly terminates the subprocess on timeout.
+    3. Escalates to proc.kill() if graceful termination times out.
+    4. Reaps the process before returning.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.sandbox.subprocess_utils import run_subprocess_safe
+
+    # Case A: Times out, proc.terminate() terminates the process within grace period
+    mock_proc_a = AsyncMock()
+    mock_proc_a.terminate = MagicMock()
+    mock_proc_a.kill = MagicMock()
+    # First communicate times out; second communicate (after terminate) returns reaped output
+    mock_proc_a.communicate.side_effect = [
+        asyncio.TimeoutError("Timeout on command"),
+        (b"output after terminate", b""),
+    ]
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc_a):
+        rc, out, err, err_msg = await run_subprocess_safe("test-cmd", ["arg1"], timeout=0.1, terminate_grace_period=0.5)
+
+    assert rc is None
+    assert "timed out after 0.1s and was terminated" in err_msg
+    mock_proc_a.terminate.assert_called_once()
+    mock_proc_a.kill.assert_not_called()
+    assert mock_proc_a.communicate.call_count == 2
+
+    # Case B: Times out, terminate does not exit in time -> escalates to proc.kill() and reaps
+    mock_proc_b = AsyncMock()
+    mock_proc_b.terminate = MagicMock()
+    mock_proc_b.kill = MagicMock()
+    mock_proc_b.communicate.side_effect = [
+        asyncio.TimeoutError("Timeout on command"),
+        asyncio.TimeoutError("Timeout on terminate grace"),
+        (b"output after kill", b""),
+    ]
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc_b):
+        rc, out, err, err_msg = await run_subprocess_safe("test-cmd", ["arg1"], timeout=0.1, terminate_grace_period=0.1, kill_grace_period=0.5)
+
+    assert rc is None
+    assert "timed out after 0.1s and was killed" in err_msg
+    mock_proc_b.terminate.assert_called_once()
+    mock_proc_b.kill.assert_called_once()
+    assert mock_proc_b.communicate.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_microsandbox_nonzero_rm_exit_with_sandbox_absent_verifies_destruction():
+    """
+    Verifies that when 'msb rm --force' returns non-zero (e.g. sandbox already removed),
+    cleanup is NOT classified as failed if independent 'msb ls' proves absence.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.sandbox.base import SandboxConfig
+    from app.services.sandbox.microsandbox_adapter import MicrosandboxAdapter
+
+    config = SandboxConfig(
+        sandbox_id="partproof-test-absent-002",
+        image="python:3.12-slim",
+        cpus=1,
+        memory_mb=512,
+        network="none",
+        timeout_seconds=30,
+        task_id="test-task-absent",
+        execution_id="test-exec-absent",
+    )
+    adapter = MicrosandboxAdapter(config)
+    adapter._provision_attempted = True
+
+    # msb rm returns non-zero (code 1, sandbox not found)
+    # msb ls returns code 0 with sandbox absent
+    with patch("os.path.exists", return_value=True), \
+         patch("app.services.sandbox.microsandbox_adapter.run_subprocess_safe", side_effect=[
+             (1, b"", b"Error: sandbox 'partproof-test-absent-002' not found\n", None),
+             (0, b"other-vm-123 running\n", b"", None),
+         ]):
+        status = await adapter.destroy()
+
+    assert status == "verified_destroyed"
+    assert adapter._is_destroyed is True
+
+
+@pytest.mark.asyncio
+async def test_microsandbox_nonzero_rm_exit_with_sandbox_present_fails_cleanup():
+    """
+    Verifies that when 'msb rm --force' returns non-zero AND 'msb ls' still detects
+    the sandbox, cleanup raises SandboxCleanupError, preserving needs_reconciliation.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.sandbox.base import SandboxConfig, SandboxCleanupError
+    from app.services.sandbox.microsandbox_adapter import MicrosandboxAdapter
+
+    config = SandboxConfig(
+        sandbox_id="partproof-test-present-003",
+        image="python:3.12-slim",
+        cpus=1,
+        memory_mb=512,
+        network="none",
+        timeout_seconds=30,
+        task_id="test-task-present",
+        execution_id="test-exec-present",
+    )
+    adapter = MicrosandboxAdapter(config)
+    adapter._provision_attempted = True
+
+    # msb rm returns non-zero (code 1)
+    # msb ls returns code 0, BUT sandbox is still present!
+    with patch("os.path.exists", return_value=True), \
+         patch("app.services.sandbox.microsandbox_adapter.run_subprocess_safe", side_effect=[
+             (1, b"", b"Error: failed to force remove container\n", None),
+             (0, b"partproof-test-present-003 running\n", b"", None),
+         ]):
+        with pytest.raises(SandboxCleanupError) as exc_info:
+            await adapter.destroy()
+
+    assert "still detected present in msb ls" in str(exc_info.value)
+    assert adapter._is_destroyed is False
+
+
+@pytest.mark.asyncio
+async def test_microsandbox_preflight_sdk_failure_skips_cli_cleanup():
+    """
+    Verifies that if SDK or runtime directory preflight fails BEFORE Sandbox.create(),
+    _provision_attempted remains False, and destroy() skips unnecessary CLI cleanup.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.sandbox.base import SandboxConfig, SandboxCreationError, UnsupportedSandboxBackendError
+    from app.services.sandbox.microsandbox_adapter import MicrosandboxAdapter
+
+    config = SandboxConfig(
+        sandbox_id="partproof-test-preflight-004",
+        image="python:3.12-slim",
+        cpus=1,
+        memory_mb=512,
+        network="none",
+        timeout_seconds=30,
+        task_id="test-task-preflight",
+        execution_id="test-exec-preflight",
+    )
+    adapter = MicrosandboxAdapter(config)
+
+    # 1. Simulate preflight runtime dir failure
+    with patch("app.services.sandbox.microsandbox_adapter._load_microsandbox_sdk", return_value=(MagicMock(), MagicMock())), \
+         patch("os.path.exists", return_value=False):
+        with pytest.raises(SandboxCreationError) as exc_info:
+            await adapter.create()
+        assert "runtime directory not found" in str(exc_info.value)
+
+    # _provision_attempted must be False
+    assert adapter._provision_attempted is False
+
+    # Calling destroy() must succeed without calling _cli_destroy_and_verify
+    with patch.object(adapter, "_cli_destroy_and_verify", AsyncMock()) as mock_cli:
+        status = await adapter.destroy()
+        mock_cli.assert_not_called()
+        assert status == "verified_destroyed"
+
+
+@pytest.mark.asyncio
+async def test_successful_cleanup_within_configured_grace_period():
+    """
+    Verifies that execution steps complete and microVM cleanup finishes
+    cleanly with 'verified_destroyed' within the configured SANDBOX_CLEANUP_TIMEOUT_SECONDS grace period.
+    """
+    manager = SandboxManager(backend_name="mock")
+
+    steps = [
+        StepExecutionRequest(
+            step_number=1,
+            description="Audit step finishing cleanly",
+            code="print('Audit step passed successfully')\n",
+        ),
+    ]
+
+    res = await manager.execute_steps(
+        task_id="test-task-grace-period",
+        execution_id="test-exec-grace-period",
+        steps=steps,
+        timeout_seconds=10.0,
+    )
+
+    assert res.status == "succeeded"
+    assert res.cleanup_status == "verified_destroyed"
+    assert len(res.step_outputs) == 1
+    assert res.step_outputs[0].status == "succeeded"

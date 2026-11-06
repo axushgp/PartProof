@@ -19,6 +19,7 @@ from app.services.sandbox.base import (
     SandboxTimeoutError,
     UnsupportedSandboxBackendError,
 )
+from app.services.sandbox.subprocess_utils import run_subprocess_safe
 
 logger = logging.getLogger("partproof.sandbox.microsandbox")
 
@@ -71,7 +72,6 @@ class MicrosandboxAdapter(BaseSandboxAdapter):
         if self._is_created and self._sandbox is not None:
             return self.config.sandbox_id
 
-        self._provision_attempted = True
         Sandbox, Network = _load_microsandbox_sdk()
 
         # Enforce home and runtime paths
@@ -86,6 +86,8 @@ class MicrosandboxAdapter(BaseSandboxAdapter):
                 )
 
         try:
+            # Set provision attempted immediately before actual Sandbox.create() invocation
+            self._provision_attempted = True
             self._sandbox_cm = await Sandbox.create(
                 self.config.sandbox_id,
                 image=self.config.image,
@@ -303,49 +305,39 @@ class MicrosandboxAdapter(BaseSandboxAdapter):
         sandbox_id = self.config.sandbox_id
 
         # Step 1: Force remove sandbox and its stored resources via msb rm --force
-        try:
-            rm_proc = await asyncio.create_subprocess_exec(
-                msb_bin,
-                "rm",
-                "--force",
-                sandbox_id,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            rm_out, rm_err = await asyncio.wait_for(rm_proc.communicate(), timeout=15.0)
-            if rm_proc.returncode != 0:
-                err_text = rm_err.decode("utf-8", errors="replace").strip()
-                logger.warning("msb rm --force for %s exited with %d: %s", sandbox_id, rm_proc.returncode, err_text)
-                return False, f"msb rm --force failed with exit code {rm_proc.returncode}: {err_text}"
-        except asyncio.TimeoutError:
-            logger.warning("msb rm --force timed out after 15s for %s", sandbox_id)
-            return False, f"msb rm --force timed out after 15.0s for '{sandbox_id}'"
-        except Exception as e:
-            logger.warning("Error invoking msb rm --force for %s: %s", sandbox_id, e)
-            return False, f"msb rm --force failed with error: {e}"
+        rm_rc, rm_out, rm_err, rm_err_msg = await run_subprocess_safe(
+            msb_bin,
+            ["rm", "--force", sandbox_id],
+            timeout=10.0,
+        )
+        if rm_err_msg:
+            logger.warning("msb rm --force for %s: %s", sandbox_id, rm_err_msg)
+        elif rm_rc != 0:
+            err_text = rm_err.decode("utf-8", errors="replace").strip()
+            # Do not immediately classify cleanup as failed; sandbox may already be absent.
+            # Independent verification via msb ls follows.
+            logger.warning("msb rm --force returned non-zero code %d for %s: %s", rm_rc, sandbox_id, err_text)
+        else:
+            logger.info("msb rm --force successfully executed for %s", sandbox_id)
 
         # Step 2: Independently verify complete absence via msb ls
-        try:
-            ls_proc = await asyncio.create_subprocess_exec(
-                msb_bin,
-                "ls",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            ls_out, ls_err = await asyncio.wait_for(ls_proc.communicate(), timeout=10.0)
-            if ls_proc.returncode != 0:
-                err_text = ls_err.decode("utf-8", errors="replace").strip()
-                return False, f"msb ls verification failed with exit code {ls_proc.returncode}: {err_text}"
+        ls_rc, ls_out, ls_err, ls_err_msg = await run_subprocess_safe(
+            msb_bin,
+            ["ls"],
+            timeout=5.0,
+        )
+        if ls_err_msg:
+            return False, f"msb ls verification failed: {ls_err_msg}"
 
-            ls_text = ls_out.decode("utf-8", errors="replace")
-            if sandbox_id in ls_text:
-                return False, f"Sandbox microVM '{sandbox_id}' still detected present in msb ls: {ls_text.strip()}"
+        if ls_rc != 0:
+            err_text = ls_err.decode("utf-8", errors="replace").strip()
+            return False, f"msb ls verification exited with code {ls_rc}: {err_text}"
 
-            return True, f"MicroVM '{sandbox_id}' confirmed absent in msb ls."
-        except asyncio.TimeoutError:
-            return False, f"msb ls verification timed out after 10.0s for '{sandbox_id}'"
-        except Exception as e:
-            return False, f"Failed to execute msb ls absence verification: {e}"
+        ls_text = ls_out.decode("utf-8", errors="replace")
+        if sandbox_id in ls_text:
+            return False, f"Sandbox microVM '{sandbox_id}' still detected present in msb ls: {ls_text.strip()}"
+
+        return True, f"MicroVM '{sandbox_id}' confirmed absent in msb ls."
 
     async def destroy(self) -> str:
         """

@@ -823,7 +823,7 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_rm_and_ls(db_sessio
     4. Persistent sandbox record: msb rm --force exits 0, but msb ls still contains sandbox ID -> needs_reconciliation
     5. Absence verification timeout: msb ls times out -> needs_reconciliation
     """
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import patch, AsyncMock, MagicMock
     from app.workers.recovery import StaleExecutionReconciler
 
     session_factory = MockSessionFactory(db_session)
@@ -869,15 +869,15 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_rm_and_ls(db_sessio
     assert exec1.cleanup_status == "verified_destroyed"
     assert task1.status == "queued"
 
-    # 2. Failed removal: msb rm --force exits with non-zero code (e.g. 1)
-    task2 = Task(user_id=user.id, title="Subproc Error Task", description="msb rm error", status="running")
+    # 2. Non-zero rm exit with sandbox already absent -> verified_destroyed!
+    task2 = Task(user_id=user.id, title="Subproc Rm Non-zero Absent Task", description="rm error but absent", status="running")
     db_session.add(task2)
     await db_session.flush()
     exec2 = Execution(
         task_id=task2.id,
         status="running",
         worker_id="old-w2",
-        sandbox_id="sb-subproc-err-2",
+        sandbox_id="sb-subproc-already-absent",
         lease_expires_at=expired,
         attempt_count=1,
     )
@@ -885,20 +885,59 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_rm_and_ls(db_sessio
     await db_session.commit()
 
     mock_rm_err = AsyncMock()
-    mock_rm_err.communicate.return_value = (b"", b"daemon failure during rm")
+    mock_rm_err.communicate.return_value = (b"", b"Error: sandbox not found\n")
     mock_rm_err.returncode = 1
+
+    mock_ls_absent2 = AsyncMock()
+    mock_ls_absent2.communicate.return_value = (b"other-vm-123 running\n", b"")
+    mock_ls_absent2.returncode = 0
 
     with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
          patch("os.path.exists", return_value=True), \
-         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_err]):
+         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_err, mock_ls_absent2]):
         count2 = await reconciler.reconcile_stale_executions(max_attempts=3)
         assert count2 == 1
 
     await db_session.refresh(exec2)
     await db_session.refresh(task2)
-    assert exec2.status == "needs_reconciliation"
-    assert exec2.cleanup_status == "leak_detected"
-    assert task2.status == "needs_reconciliation"
+    assert exec2.status == "queued"
+    assert exec2.cleanup_status == "verified_destroyed"
+    assert task2.status == "queued"
+
+    # 2b. Non-zero rm exit with sandbox still present -> needs_reconciliation
+    task2b = Task(user_id=user.id, title="Subproc Rm Non-zero Present Task", description="rm error and present", status="running")
+    db_session.add(task2b)
+    await db_session.flush()
+    exec2b = Execution(
+        task_id=task2b.id,
+        status="running",
+        worker_id="old-w2b",
+        sandbox_id="sb-subproc-still-present",
+        lease_expires_at=expired,
+        attempt_count=1,
+    )
+    db_session.add(exec2b)
+    await db_session.commit()
+
+    mock_rm_err_present = AsyncMock()
+    mock_rm_err_present.communicate.return_value = (b"", b"Error: device or resource busy\n")
+    mock_rm_err_present.returncode = 1
+
+    mock_ls_present = AsyncMock()
+    mock_ls_present.communicate.return_value = (b"sb-subproc-still-present running\n", b"")
+    mock_ls_present.returncode = 0
+
+    with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
+         patch("os.path.exists", return_value=True), \
+         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_err_present, mock_ls_present]):
+        count2b = await reconciler.reconcile_stale_executions(max_attempts=3)
+        assert count2b == 1
+
+    await db_session.refresh(exec2b)
+    await db_session.refresh(task2b)
+    assert exec2b.status == "needs_reconciliation"
+    assert exec2b.cleanup_status == "leak_detected"
+    assert task2b.status == "needs_reconciliation"
 
     # 3. Timeout: msb rm --force times out
     task3 = Task(user_id=user.id, title="Subproc Timeout Rm Task", description="timeout on rm", status="running")
@@ -916,6 +955,8 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_rm_and_ls(db_sessio
     await db_session.commit()
 
     mock_rm_timeout = AsyncMock()
+    mock_rm_timeout.terminate = MagicMock()
+    mock_rm_timeout.kill = MagicMock()
     mock_rm_timeout.communicate.side_effect = asyncio.TimeoutError()
 
     with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
@@ -981,6 +1022,8 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_rm_and_ls(db_sessio
     await db_session.commit()
 
     mock_ls_timeout = AsyncMock()
+    mock_ls_timeout.terminate = MagicMock()
+    mock_ls_timeout.kill = MagicMock()
     mock_ls_timeout.communicate.side_effect = asyncio.TimeoutError()
 
     with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \

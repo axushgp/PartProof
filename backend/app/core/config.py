@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     SANDBOX_DEFAULT_MEMORY_MB: int = Field(default=512)
     SANDBOX_MAX_MEMORY_MB: int = Field(default=1024)
     SANDBOX_DEFAULT_NETWORK: str = Field(default="none")
-    SANDBOX_CLEANUP_TIMEOUT_SECONDS: float = Field(default=15.0)
+    SANDBOX_CLEANUP_TIMEOUT_SECONDS: float = Field(default=30.0)
 
     # Distributed Worker Configuration
     WORKER_ID: str = Field(default_factory=lambda: f"worker-{uuid.uuid4().hex[:8]}")
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     WORKER_LEASE_DURATION_SECONDS: int = Field(default=60)
     WORKER_HEARTBEAT_INTERVAL_SECONDS: float = Field(default=15.0)
     WORKER_MAX_ATTEMPTS: int = Field(default=3)
-    WORKER_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: float = Field(default=15.0)
+    WORKER_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: float = Field(default=30.0)
     WORKER_LOCK_FILE_PATH: str = Field(default="/tmp/partproof_worker.lock")
 
     # Database

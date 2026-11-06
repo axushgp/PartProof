@@ -17,7 +17,7 @@ LimitNOFILE=65536
 
 # Graceful termination for MicroVM cleanup
 KillMode=mixed
-TimeoutStopSec=30
+TimeoutStopSec=45
 Restart=on-failure
 RestartSec=5s
 
