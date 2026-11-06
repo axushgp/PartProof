@@ -78,22 +78,39 @@ async def _shielded_terminate_and_reap(
     terminate_grace_period: float,
     kill_grace_period: float,
     reason: str,
+    initial_cancelled_exc: Optional[asyncio.CancelledError] = None,
 ) -> Tuple[Optional[int], bytes, bytes, str, bool]:
     """
     Executes _do_terminate_and_reap inside an independent shielded Task,
     ensuring parent cancellations cannot interrupt process termination and reaping.
+    Tracks whether cancellation occurred initially or while awaiting the shielded
+    cleanup task. Once cleanup completes, any cancellation received is propagated.
     """
     task = asyncio.create_task(
         _do_terminate_and_reap(
             proc, cmd, args, terminate_grace_period, kill_grace_period, reason
         )
     )
+    cancelled_exc: Optional[asyncio.CancelledError] = initial_cancelled_exc
     while not task.done():
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
-            pass
-    return task.result()
+        except asyncio.CancelledError as ce:
+            cancelled_exc = ce
+
+    rc, out, err, msg, confirmed = task.result()
+
+    if cancelled_exc is not None:
+        if not confirmed:
+            logger.error(
+                "Subprocess '%s' cancelled during cleanup and cleanup unverified: %s",
+                cmd,
+                msg,
+            )
+            raise asyncio.CancelledError(msg) from cancelled_exc
+        raise cancelled_exc
+
+    return rc, out, err, msg, confirmed
 
 
 async def run_subprocess_safe(
@@ -116,9 +133,12 @@ async def run_subprocess_safe(
        kill-escalation, and reaping sequence inside a shielded task to protect cleanup
        from being interrupted by the parent cancellation, ensuring no spawned process
        is abandoned before propagating `CancelledError`.
-    4. If process exit cannot be verified (e.g. final wait after kill times out or fails),
+    4. Tracks whether cancellation occurs while awaiting the shielded cleanup task (including
+       during timeout-triggered cleanup). Never interrupts cleanup, but propagates any received
+       cancellation once cleanup finishes.
+    5. If process exit cannot be verified (e.g. final wait after kill times out or fails),
        reports cleanup as unverified and does not claim the process was reaped.
-    5. Cleanly integrates with configurable grace periods (e.g. `SANDBOX_CLEANUP_TIMEOUT_SECONDS`, default 30.0s).
+    6. Cleanly integrates with configurable grace periods (e.g. `SANDBOX_CLEANUP_TIMEOUT_SECONDS`, default 30.0s).
 
     Returns:
         (returncode, stdout, stderr, error_msg)
@@ -151,6 +171,7 @@ async def run_subprocess_safe(
             terminate_grace_period,
             kill_grace_period,
             reason=f"timed out after {timeout}s",
+            initial_cancelled_exc=None,
         )
         return rc, out, err, msg
     except asyncio.CancelledError as ce:
@@ -166,14 +187,8 @@ async def run_subprocess_safe(
             terminate_grace_period,
             kill_grace_period,
             reason="cancelled by parent coroutine",
+            initial_cancelled_exc=ce,
         )
-        if not confirmed:
-            logger.error(
-                "Subprocess '%s' cancelled and cleanup unverified: %s",
-                cmd,
-                msg,
-            )
-            raise asyncio.CancelledError(msg) from ce
-        raise
+        return rc, out, err, msg
     except Exception as e:
         return None, b"", b"", f"Unexpected error executing '{cmd}': {e}"

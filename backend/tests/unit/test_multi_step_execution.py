@@ -584,6 +584,103 @@ async def test_subprocess_safe_cancellation_kill_escalation():
 
 
 @pytest.mark.asyncio
+async def test_subprocess_safe_timeout_then_cancelled_propagates_cancellation():
+    """
+    Regression test:
+    Command times out, termination cleanup starts, then parent is cancelled.
+    1. _do_terminate_and_reap is shielded and runs to completion (reaping process).
+    2. run_subprocess_safe propagates CancelledError instead of suppressing it and returning normally.
+    """
+    import asyncio
+    from unittest.mock import MagicMock, patch
+    from app.services.sandbox.subprocess_utils import run_subprocess_safe
+
+    mock_proc = MagicMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.returncode = None
+    calls = 0
+
+    async def mock_communicate():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # First communicate times out
+            raise asyncio.TimeoutError("Command execution timed out")
+        # Second communicate runs during termination grace period
+        await asyncio.sleep(0.15)
+        return b"term reaped", b""
+
+    mock_proc.communicate = MagicMock(side_effect=mock_communicate)
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        task = asyncio.create_task(
+            run_subprocess_safe("test-timeout-cancel", ["arg"], timeout=0.05, terminate_grace_period=0.5)
+        )
+        # Wait for command timeout to trigger and enter shielded cleanup
+        await asyncio.sleep(0.08)
+        # Cancel the task while it is awaiting termination cleanup
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_not_called()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_subprocess_safe_double_cancellation_during_cleanup():
+    """
+    Regression test:
+    Parent coroutine is cancelled twice during cleanup.
+    1. Never interrupts _do_terminate_and_reap.
+    2. Cleanup must still complete, terminate and reap process.
+    3. Cancellation must propagate.
+    """
+    import asyncio
+    from unittest.mock import MagicMock, patch
+    from app.services.sandbox.subprocess_utils import run_subprocess_safe
+
+    mock_proc = MagicMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.returncode = None
+    calls = 0
+
+    async def mock_communicate():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(10.0)
+            return b"", b""
+        # Cleanup communicate runs for a short duration
+        await asyncio.sleep(0.2)
+        return b"reaped", b""
+
+    mock_proc.communicate = MagicMock(side_effect=mock_communicate)
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        task = asyncio.create_task(
+            run_subprocess_safe("test-double-cancel", ["arg"], timeout=10.0, terminate_grace_period=0.6)
+        )
+        await asyncio.sleep(0.05)
+        # Cancel 1st time (starts cleanup)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        # Cancel 2nd time (while cleanup is running)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_not_called()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_subprocess_safe_failure_to_confirm_reaping_reports_uncertainty():
     """
     Verifies that if the final wait after proc.kill() fails or times out:
