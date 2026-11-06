@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import os
 from urllib.parse import urlparse
 import pytest
@@ -44,6 +45,70 @@ pytestmark = pytest.mark.skipif(
     reason="PostgreSQL integration tests require RUN_POSTGRES_TESTS=1 and TEST_POSTGRES_DATABASE_URL",
 )
 
+
+@asynccontextmanager
+async def postgres_test_context():
+    """
+    Sets up an isolated PostgreSQL test environment:
+    1. Validates test database URL safety.
+    2. Runs Alembic migrations against the test database.
+    3. Overrides FastAPI get_db dependency with isolated PostgreSQL session factory.
+    4. Deterministically restores all environment variables and dependency overrides in cleanup.
+    5. Disposes the async engine cleanly.
+    """
+    assert TEST_POSTGRES_URL is not None
+    try:
+        validate_test_database_url(TEST_POSTGRES_URL)
+    except ValueError as e:
+        pytest.fail(f"Configured TEST_POSTGRES_DATABASE_URL failed safety check: {e}")
+
+    orig_alembic_url = os.environ.get("ALEMBIC_DATABASE_URL")
+    os.environ["ALEMBIC_DATABASE_URL"] = TEST_POSTGRES_URL
+
+    from alembic import command
+    from alembic.config import Config
+
+    backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    alembic_ini_path = os.path.join(backend_root, "alembic.ini")
+    alembic_cfg = Config(alembic_ini_path)
+
+    # Execute Alembic migrations on dedicated PostgreSQL test DB
+    await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+
+    pg_engine = create_async_engine(
+        TEST_POSTGRES_URL,
+        pool_size=10,
+        max_overflow=20,
+        echo=False,
+    )
+    PgTestingSessionLocal = async_sessionmaker(pg_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override_postgres_get_db():
+        async with PgTestingSessionLocal() as session:
+            yield session
+
+    prev_override = app.dependency_overrides.get(get_db)
+    app.dependency_overrides[get_db] = override_postgres_get_db
+
+    try:
+        yield PgTestingSessionLocal
+    finally:
+        # Restore dependency overrides
+        if prev_override is not None:
+            app.dependency_overrides[get_db] = prev_override
+        else:
+            app.dependency_overrides.pop(get_db, None)
+
+        # Restore environment variable
+        if orig_alembic_url is not None:
+            os.environ["ALEMBIC_DATABASE_URL"] = orig_alembic_url
+        else:
+            os.environ.pop("ALEMBIC_DATABASE_URL", None)
+
+        # Cleanly dispose PostgreSQL engine connection pool
+        await pg_engine.dispose()
+
+
 MOCK_SEED_PLAN = TaskPlanSchema(
     title="PostgreSQL Concurrency Row-Lock Test Plan",
     summary="Validates pessimistic row-locking and idempotency across concurrent workers",
@@ -65,57 +130,75 @@ MOCK_SEED_PLAN = TaskPlanSchema(
 
 
 @pytest.mark.asyncio
+async def test_postgres_token_authentication_resolution():
+    """
+    Regression test verifying that create_access_token(subject=user_id) produces
+    a JWT whose subject string correctly resolves the seeded PostgreSQL test user
+    through the get_current_user authentication dependency.
+    """
+    async with postgres_test_context() as PgTestingSessionLocal:
+        # 1. Seed dedicated test user in PostgreSQL
+        async with PgTestingSessionLocal() as session:
+            res = await session.execute(
+                select(User).where(User.email == "auth_verify@partproof-test.io")
+            )
+            test_user = res.scalar_one_or_none()
+            if not test_user:
+                test_user = User(
+                    email="auth_verify@partproof-test.io",
+                    password_hash=get_password_hash("AuthVerifyPass2026!"),
+                    role="auditor",
+                    is_active=True,
+                )
+                session.add(test_user)
+                await session.commit()
+                await session.refresh(test_user)
+
+            user_id = test_user.id
+            user_email = test_user.email
+            user_role = test_user.role
+
+        # 2. Generate access token with subject=user_id
+        token = create_access_token(subject=user_id)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 3. Call /api/v1/auth/me to verify full auth resolution against PostgreSQL
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/v1/auth/me", headers=headers)
+            assert resp.status_code == 200, f"Expected 200 OK, got {resp.status_code}: {resp.text}"
+            data = resp.json()
+            assert data["id"] == user_id
+            assert data["email"] == user_email
+            assert data["role"] == user_role
+
+            # 4. Verify that an invalid subject fails authentication with 401
+            invalid_token = create_access_token(subject="nonexistent-user-uuid")
+            bad_resp = await client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {invalid_token}"},
+            )
+            assert bad_resp.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_postgres_concurrent_approval_row_locking():
     """
     Verifies that concurrent approval requests against a real PostgreSQL database
     utilizing pessimistic row-level locking (SELECT ... FOR UPDATE OF tasks) and
     unique constraints result in:
-    1. Exactly one approved decision.
-    2. Exactly one queued execution.
-    3. Execution hash matching approved plan.
-    4. Execution snapshot matching approved plan.
-    5. Conflicting decisions unable to overwrite existing approval (409 Conflict).
-    6. Transactions leaving zero partial or orphaned records.
-    7. Consistent resolution of concurrent approval vs cancellation requests.
+    1. All concurrent requests returning valid HTTP responses (no unhandled exceptions).
+    2. Exactly one approved decision with at least one 200 OK response.
+    3. Exactly one queued execution in PostgreSQL.
+    4. Execution hash matching approved plan.
+    5. Execution snapshot matching approved plan.
+    6. Conflicting decisions unable to overwrite existing approval (409 Conflict).
+    7. Database transactions leaving zero partial or orphaned records.
+    8. Deterministic and safe resolution of concurrent approval vs cancellation race.
     """
-    assert TEST_POSTGRES_URL is not None
-    try:
-        validate_test_database_url(TEST_POSTGRES_URL)
-    except ValueError as e:
-        pytest.fail(f"Configured TEST_POSTGRES_DATABASE_URL failed safety check: {e}")
-
-    # 1. Run actual Alembic migrations on the PostgreSQL test database in a separate thread
-    from alembic import command
-    from alembic.config import Config
-
-    backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    alembic_ini_path = os.path.join(backend_root, "alembic.ini")
-    alembic_cfg = Config(alembic_ini_path)
-
-    os.environ["ALEMBIC_DATABASE_URL"] = TEST_POSTGRES_URL
-    await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
-
-    # 2. Create isolated async engine and session factory for PostgreSQL test DB
-    pg_engine = create_async_engine(
-        TEST_POSTGRES_URL,
-        pool_size=10,
-        max_overflow=20,
-        echo=False,
-    )
-    PgTestingSessionLocal = async_sessionmaker(pg_engine, class_=AsyncSession, expire_on_commit=False)
-
-    async def override_postgres_get_db():
+    async with postgres_test_context() as PgTestingSessionLocal:
+        # 1. Seed dedicated test user in PostgreSQL
         async with PgTestingSessionLocal() as session:
-            yield session
-
-    # 3. Save existing get_db override and inject PostgreSQL session factory
-    prev_override = app.dependency_overrides.get(get_db)
-    app.dependency_overrides[get_db] = override_postgres_get_db
-
-    try:
-        # 4. Seed dedicated test user (not production credentials)
-        async with PgTestingSessionLocal() as session:
-            # Upsert or fetch test user
             res = await session.execute(
                 select(User).where(User.email == "test_auditor@partproof-test.io")
             )
@@ -132,13 +215,12 @@ async def test_postgres_concurrent_approval_row_locking():
                 await session.refresh(test_user)
 
             user_id = test_user.id
-            user_email = test_user.email
-            user_role = test_user.role
 
-        token = create_access_token({"sub": user_id, "email": user_email, "role": user_role})
+        # Use subject=user_id for correct token claim encoding
+        token = create_access_token(subject=user_id)
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 5. Seed a test task with policy-approved plan directly in PostgreSQL
+        # 2. Seed a test task with policy-approved plan directly in PostgreSQL
         plan_json = MOCK_SEED_PLAN.model_dump(mode="json")
         plan_hash = compute_plan_hash(plan_json)
         policy_res = DeterministicPolicyEngine().evaluate(MOCK_SEED_PLAN)
@@ -168,7 +250,7 @@ async def test_postgres_concurrent_approval_row_locking():
             session.add(plan1)
             await session.commit()
 
-        # 6. Fire 3 concurrent approval requests simultaneously
+        # 3. Fire 3 concurrent approval requests simultaneously
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             reqs = [
@@ -181,13 +263,29 @@ async def test_postgres_concurrent_approval_row_locking():
             ]
             responses = await asyncio.gather(*reqs, return_exceptions=True)
 
-            status_codes = [r.status_code for r in responses if hasattr(r, "status_code")]
-            # All successful requests must return 200 (idempotent duplicate responses)
-            for sc in status_codes:
-                assert sc in (200, 409)
-            assert 200 in status_codes
+            # Ensure none of the concurrent requests threw unhandled exceptions
+            for idx, r in enumerate(responses):
+                if isinstance(r, Exception):
+                    raise AssertionError(
+                        f"Concurrent approval request #{idx + 1} raised an unhandled exception: {r}"
+                    ) from r
+                assert hasattr(r, "status_code"), (
+                    f"Concurrent request #{idx + 1} returned unexpected non-response object: {r}"
+                )
 
-        # 7. Assertions directly against PostgreSQL database
+            # Assert all three HTTP requests returned actual HTTP responses
+            assert len(responses) == 3
+
+            status_codes = [r.status_code for r in responses]
+            # At least one approval request must succeed with 200 OK
+            assert 200 in status_codes, f"Expected at least one 200 OK approval, got: {status_codes}"
+            # Every response must be either 200 (approval/idempotent duplicate) or 409 (conflict)
+            for sc in status_codes:
+                assert sc in (200, 409), (
+                    f"Unexpected status code {sc} among concurrent approval responses: {status_codes}"
+                )
+
+        # 4. Assertions directly against PostgreSQL database
         async with PgTestingSessionLocal() as session:
             # Exactly one execution must exist in PostgreSQL
             exec_res = await session.execute(
@@ -222,7 +320,7 @@ async def test_postgres_concurrent_approval_row_locking():
             event_types = [e.event_type for e in events]
             assert "execution_queued" in event_types
 
-        # 8. Assert conflicting decision cannot overwrite existing approval
+        # 5. Assert conflicting decision cannot overwrite existing approval
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             conflict_resp = await client.post(
                 f"/api/v1/tasks/{task1_id}/approve",
@@ -230,7 +328,10 @@ async def test_postgres_concurrent_approval_row_locking():
                 headers=headers,
             )
             assert conflict_resp.status_code == 409
-            assert "already approved" in conflict_resp.json()["detail"].lower() or "conflicting" in conflict_resp.json()["detail"].lower()
+            assert (
+                "already approved" in conflict_resp.json()["detail"].lower()
+                or "conflicting" in conflict_resp.json()["detail"].lower()
+            )
 
             # Confirm database remains unchanged
             async with PgTestingSessionLocal() as session:
@@ -241,7 +342,7 @@ async def test_postgres_concurrent_approval_row_locking():
                 assert len(approvals2) == 1
                 assert approvals2[0].decision == "approved"
 
-        # 9. Test concurrent Approval vs Cancellation
+        # 6. Test concurrent Approval vs Cancellation
         async with PgTestingSessionLocal() as session:
             task2 = Task(
                 user_id=user_id,
@@ -280,16 +381,21 @@ async def test_postgres_concurrent_approval_row_locking():
             )
             res_appr, res_cancel = await asyncio.gather(appr_coro, cancel_coro, return_exceptions=True)
 
-            # Both endpoints must succeed (200) or one succeed and one handle transition cleanly
-            codes = [r.status_code for r in (res_appr, res_cancel) if hasattr(r, "status_code")]
-            for c in codes:
-                assert c in (200, 400, 409)
+            # Ensure neither request raised unhandled exceptions
+            if isinstance(res_appr, Exception):
+                raise AssertionError(f"Approval request in race test raised an exception: {res_appr}") from res_appr
+            if isinstance(res_cancel, Exception):
+                raise AssertionError(f"Cancellation request in race test raised an exception: {res_cancel}") from res_cancel
+
+            assert hasattr(res_appr, "status_code")
+            assert hasattr(res_cancel, "status_code")
+            assert res_appr.status_code in (200, 400, 409)
+            assert res_cancel.status_code in (200, 400, 409)
 
         # Confirm consistent state in PostgreSQL (no partial or orphaned state)
         async with PgTestingSessionLocal() as session:
             t2_res = await session.execute(select(Task).where(Task.id == task2_id))
             t2 = t2_res.scalar_one()
-            # Task must either be cancelled or queued
             assert t2.status in ("cancelled", "queued")
 
             exec2_res = await session.execute(
@@ -298,15 +404,4 @@ async def test_postgres_concurrent_approval_row_locking():
             execs2 = exec2_res.scalars().all()
             assert len(execs2) <= 1
             if execs2:
-                # If execution was created, its status must match task state
                 assert execs2[0].status in ("queued", "cancelled")
-
-    finally:
-        # Restore original dependency overrides
-        if prev_override is not None:
-            app.dependency_overrides[get_db] = prev_override
-        else:
-            app.dependency_overrides.pop(get_db, None)
-
-        # Dispose PostgreSQL engine
-        await pg_engine.dispose()
