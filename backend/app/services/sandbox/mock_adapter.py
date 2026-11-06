@@ -32,6 +32,7 @@ class MockSandboxAdapter(BaseSandboxAdapter):
             
         self.simulated_guest_kernel = "simulated-kernel-6.12.113-mock"
         self._last_request: Optional[ExecutionRequest] = None
+        self.executed_requests: List[ExecutionRequest] = []
 
     async def create(self) -> str:
         """Simulates microVM provisioning."""
@@ -51,6 +52,7 @@ class MockSandboxAdapter(BaseSandboxAdapter):
             await self.create()
 
         self._last_request = request
+        self.executed_requests.append(request)
         self.artifact_manager.validate_source_code(request.code)
 
         start_time = time.monotonic()
@@ -108,6 +110,13 @@ class MockSandboxAdapter(BaseSandboxAdapter):
         """
         Generates simulated output artifacts corresponding to expected filenames.
         """
+        if "SIMULATE_MISSING_ARTIFACT" in getattr(self._last_request, "code", ""):
+            raise ArtifactCollectionError(
+                "Simulated missing artifact failure during extraction",
+                task_id=self.config.task_id,
+                execution_id=self.config.execution_id,
+            )
+
         collected: List[ArtifactMetadata] = []
         if not expected_names:
             return collected

@@ -108,6 +108,7 @@ class Execution(Base):
     cpu_limit: Mapped[int] = mapped_column(Integer, default=1)
     memory_limit_mb: Mapped[int] = mapped_column(Integer, default=512)
     network_mode: Mapped[str] = mapped_column(String(50), default="none")
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=30)
     guest_kernel: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     
     # Distributed worker execution lease tracking
@@ -135,10 +136,14 @@ class Execution(Base):
 
 class ExecutionStep(Base):
     __tablename__ = "execution_steps"
+    __table_args__ = (
+        UniqueConstraint("execution_id", "step_number", "attempt_number", name="uq_execution_step_attempt"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     execution_id: Mapped[str] = mapped_column(String(36), ForeignKey("executions.id", ondelete="CASCADE"), nullable=False, index=True)
     step_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1)
     description: Mapped[str] = mapped_column(String(255), nullable=False)
     execution_type: Mapped[str] = mapped_column(String(50), default="python")
     code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

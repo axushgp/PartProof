@@ -116,6 +116,47 @@ class ExecutionResult(BaseModel):
     error_message: Optional[str] = None
 
 
+class StepExecutionRequest(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    step_number: int = Field(ge=1, description="1-indexed step number")
+    description: str = Field(description="Step description")
+    execution_type: str = Field(default="python", description="Execution type, e.g. 'python'")
+    code: str = Field(description="Python source code for this step")
+    filename: Optional[str] = Field(default=None, description="Optional filename inside guest")
+    timeout_seconds: Optional[float] = Field(default=None, description="Optional per-step timeout")
+
+
+class StepExecutionOutput(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    step_number: int
+    stdout: str = Field(default="")
+    stderr: str = Field(default="")
+    exit_code: int = Field(default=0)
+    duration_seconds: float = Field(default=0.0)
+    status: str = Field(default="succeeded", description="'succeeded' | 'failed' | 'timed_out' | 'skipped'")
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class MultiStepExecutionResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    execution_id: str
+    sandbox_id: str
+    status: str = Field(description="'succeeded' | 'failed' | 'timed_out' | 'cancelled'")
+    step_outputs: List[StepExecutionOutput] = Field(default_factory=list)
+    artifacts: List[ArtifactMetadata] = Field(default_factory=list)
+    cleanup_status: str = Field(default="pending", description="'verified_destroyed' | 'failed' | 'pending'")
+    execution_mode: str = Field(description="'mock' | 'microsandbox'")
+    duration_seconds: float = Field(default=0.0)
+    exit_code: int = Field(default=0)
+    guest_kernel: Optional[str] = None
+    error_message: Optional[str] = None
+
+
 # ============================================================================
 # Abstract Sandbox Adapter Interface
 # ============================================================================
@@ -168,13 +209,22 @@ class BaseSandboxAdapter(ABC):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        cleanup_exc = None
         try:
             await self.destroy()
-        except Exception:
+        except Exception as e:
+            cleanup_exc = e
             # Destruction must attempt cleanup even if an exception occurred
             if not self._is_destroyed:
                 try:
                     await self.destroy()
-                except Exception:
-                    pass
-            raise
+                    cleanup_exc = None
+                except Exception as retry_e:
+                    cleanup_exc = retry_e
+
+        if cleanup_exc is not None:
+            if exc_val is not None:
+                raise cleanup_exc from exc_val
+            raise cleanup_exc
+
+        return False

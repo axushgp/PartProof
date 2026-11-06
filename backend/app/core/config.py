@@ -1,4 +1,6 @@
 import os
+import platform
+import uuid
 from typing import List
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +60,15 @@ class Settings(BaseSettings):
     SANDBOX_MAX_MEMORY_MB: int = Field(default=1024)
     SANDBOX_DEFAULT_NETWORK: str = Field(default="none")
 
+    # Distributed Worker Configuration
+    WORKER_ID: str = Field(default_factory=lambda: f"worker-{uuid.uuid4().hex[:8]}")
+    WORKER_POLL_INTERVAL_SECONDS: float = Field(default=2.0)
+    WORKER_LEASE_DURATION_SECONDS: int = Field(default=60)
+    WORKER_HEARTBEAT_INTERVAL_SECONDS: float = Field(default=15.0)
+    WORKER_MAX_ATTEMPTS: int = Field(default=3)
+    WORKER_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: float = Field(default=15.0)
+    WORKER_LOCK_FILE_PATH: str = Field(default="/tmp/partproof_worker.lock")
+
     # Database
     DATABASE_URL: str = Field(default="sqlite+aiosqlite:///./partproof.db")
 
@@ -106,6 +117,31 @@ class Settings(BaseSettings):
                 raise RuntimeError(
                     "CRITICAL SECURITY INVARIANT VIOLATION: "
                     "Default predictable demo user password is not permitted in production."
+                )
+
+    def validate_worker_production_invariants(self):
+        """Hard safety invariants for worker execution."""
+        if self.PARTPROOF_ENV == "production":
+            self.validate_production_invariants()
+            if "sqlite" in self.DATABASE_URL.lower():
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "Production worker requires PostgreSQL (SKIP LOCKED support); SQLite is forbidden in production."
+                )
+            if self.SANDBOX_BACKEND != "microsandbox":
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "Production worker requires SANDBOX_BACKEND='microsandbox'."
+                )
+            if platform.system() != "Linux":
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "Production worker with Microsandbox must run on Linux."
+                )
+            if not os.path.exists("/dev/kvm"):
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "Production worker requires /dev/kvm for hardware-assisted virtualization."
                 )
 
 

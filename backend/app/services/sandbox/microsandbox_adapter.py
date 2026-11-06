@@ -209,7 +209,11 @@ class MicrosandboxAdapter(BaseSandboxAdapter):
                         with open(host_dest_path, "wb") as f:
                             f.write(content_bytes)
                     else:
-                        continue
+                        raise ArtifactCollectionError(
+                            f"Declared expected artifact '{safe_name}' was not found in guest workspace at '{guest_path}' (cat exited with {cat_res.exit_code})",
+                            task_id=self.config.task_id,
+                            execution_id=self.config.execution_id,
+                        )
 
                 if host_dest_path.exists():
                     meta = self.artifact_manager.register_host_artifact(
@@ -219,9 +223,21 @@ class MicrosandboxAdapter(BaseSandboxAdapter):
                         filename=safe_name,
                     )
                     collected.append(meta)
+                else:
+                    raise ArtifactCollectionError(
+                        f"Expected artifact '{safe_name}' could not be located on host after transfer",
+                        task_id=self.config.task_id,
+                        execution_id=self.config.execution_id,
+                    )
 
-            except Exception:
-                continue
+            except ArtifactCollectionError:
+                raise
+            except Exception as e:
+                raise ArtifactCollectionError(
+                    f"Failed to extract declared artifact '{safe_name}' from guest: {e}",
+                    task_id=self.config.task_id,
+                    execution_id=self.config.execution_id,
+                ) from e
 
         self.artifact_manager.validate_artifact_collection_limits(collected)
         return collected
@@ -242,13 +258,14 @@ class MicrosandboxAdapter(BaseSandboxAdapter):
 
         self._sandbox = None
         self._sandbox_cm = None
-        self._is_destroyed = True
 
         if cleanup_error:
+            # Keep _is_destroyed = False so destruction can be retried
             raise SandboxCleanupError(
                 f"Failed to cleanly destroy microVM '{self.config.sandbox_id}': {cleanup_error}",
                 task_id=self.config.task_id,
                 execution_id=self.config.execution_id,
             ) from cleanup_error
 
+        self._is_destroyed = True
         return "verified_destroyed"

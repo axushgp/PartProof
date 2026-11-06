@@ -161,3 +161,36 @@ PartProof enforces a strict state machine across the lifecycle of every audit ta
 * **Row-Level Locking**: `SELECT ... FOR UPDATE OF tasks` guarantees mutual exclusion on task state transitions, eliminating race conditions during concurrent approval or cancellation requests.
 * **Cryptographic Binding**: Approval re-computes `compute_plan_hash(plan_json)` and asserts equality against `plan_hash` before recording an approval or queuing an execution.
 * **Plan Snapshot**: The queued `Execution` entity captures an immutable copy of `plan_snapshot` and `plan_hash` at the exact moment of approval, preventing post-approval modifications.
+
+---
+
+## 4. Worker Execution Engine & Distributed Concurrency
+
+### 4.1 Queue Processing (`QueueManager`)
+* **PostgreSQL Row-Level Locking (`SKIP LOCKED`)**: Worker queue claim queries use `SELECT ... FROM tasks JOIN executions ... FOR UPDATE SKIP LOCKED` ordered by `queued_at ASC`. This guarantees parallel workers never block or claim the same execution.
+* **Lock Ordering Invariant**: Always lock `Task` first using `FOR UPDATE SKIP LOCKED`, then lock `Execution` within the same transaction. This eliminates deadlocks between concurrent workers and API endpoints.
+* **Transaction Boundary**: The claim transaction commits *before* microVM provisioning starts. Database connections and locks are never held open during isolated code execution.
+
+### 4.2 Single-Host Concurrency Control (`HostLock`)
+* The Vultr host has 2 vCPUs and is configured for `SANDBOX_MAX_CONCURRENT=1`.
+* `HostLock` utilizes advisory file locking (`fcntl.flock` on Linux, with fallback support on Windows) on `settings.WORKER_LOCK_FILE_PATH`. Only a single worker daemon process can run on the host at any given time.
+
+### 4.3 Distributed Lease Management (`LeaseManager`)
+* Executions are claimed with a time-limited lease (default 60s).
+* Heartbeat loop renews the lease every 15s using atomic Compare-And-Swap (CAS) SQL:
+  `UPDATE executions SET lease_expires_at = :new_lease WHERE id = :id AND worker_id = :worker_id AND status IN ('preparing', 'running', 'verifying')`.
+* If a worker loses its lease (e.g. preempted or DB error), execution halts immediately.
+
+### 4.4 Stale Worker & MicroVM Reconciliation (`StaleExecutionReconciler`)
+* Lease expiration does NOT prove the microVM stopped running.
+* Before requeueing an execution whose lease expired, the reconciler checks microVM status via `msb stop` / `msb ls`.
+* If microVM absence is verified and attempt count is under `WORKER_MAX_ATTEMPTS`, the execution is requeued.
+* If absence cannot be confirmed, both `Task` and `Execution` transition to `needs_reconciliation` for operator intervention.
+
+### 4.5 Multi-Step MicroVM Execution (`SandboxManager.execute_steps`)
+* Up to 3 plan steps execute sequentially within the **same** isolated MicroVM.
+* Guest `/workspace` is preserved across steps, allowing subsequent steps to read intermediate files written by prior steps.
+* **Fail-Fast**: If any step exits with a non-zero exit code or times out, subsequent steps are skipped immediately.
+* **Real-Time Step Persistence**: Step stdout, stderr, exit code, and timestamps are saved to `execution_steps` via an immediate callback upon step finish.
+* **Artifact Enforcement**: All declared expected artifacts must exist in guest `/workspace/output/`. Missing declared artifacts raise `ArtifactCollectionError` and transition execution to `failed`.
+* **Guaranteed Teardown**: Sandbox destruction (`adapter.destroy()`) is executed in context-managed finally blocks, ensuring zero leaked resources.

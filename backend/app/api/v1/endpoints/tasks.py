@@ -511,6 +511,7 @@ async def approve_or_reject_task(
                 cpu_limit=fresh_policy_res.cpu_limit or settings.SANDBOX_DEFAULT_CPUS,
                 memory_limit_mb=fresh_policy_res.memory_limit_mb or settings.SANDBOX_DEFAULT_MEMORY_MB,
                 network_mode=fresh_policy_res.network_mode or "none",
+                timeout_seconds=fresh_policy_res.timeout_seconds or settings.SANDBOX_DEFAULT_TIMEOUT_SECONDS,
                 queued_at=datetime.now(timezone.utc),
             )
             db.add(execution)

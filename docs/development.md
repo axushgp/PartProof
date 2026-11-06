@@ -83,6 +83,22 @@ The PostgreSQL concurrency test (`tests/integration/test_postgres_concurrency.py
 TEST_POSTGRES_DATABASE_URL="postgresql+asyncpg://linuxuser:secret@localhost:5432/partproof_test" \
 RUN_POSTGRES_TESTS=1 \
 pytest backend/tests/integration/test_postgres_concurrency.py -v
+
+# Run real Microsandbox worker multi-step integration test on Vultr VM (KVM):
+RUN_MICROSANDBOX_WORKER_INTEGRATION=1 \
+pytest backend/tests/integration/test_microsandbox_worker_real.py -v
+```
+
+### Running the Execution Worker
+
+The worker daemon runs as an independent process from the FastAPI server:
+
+```bash
+# Run worker once (processes next queued execution and exits):
+python -m app.workers.execution_worker --once
+
+# Run worker continuously:
+python -m app.workers.execution_worker
 ```
 
 ---
@@ -92,4 +108,11 @@ On the Vultr VM (`partproof-sandbox-01`, 207.148.105.25):
 * User: `linuxuser`
 * Backend runs natively with `SANDBOX_BACKEND=microsandbox`
 * PostgreSQL runs via Docker Compose on `127.0.0.1:5432`
-* Systemd manages FastAPI and Worker daemons
+* Systemd manages FastAPI and Worker daemons (`infra/systemd/partproof-worker.service`):
+
+```bash
+sudo cp infra/systemd/partproof-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now partproof-worker
+sudo systemctl status partproof-worker
+```

@@ -54,6 +54,26 @@
   - **TOCTOU Elimination**: When an approval is recorded, the full approved plan structure is serialized into `Execution.plan_snapshot` alongside `Execution.plan_hash`. The worker executes strictly against this immutable snapshot, eliminating time-of-check-to-time-of-use exploits.
   - **Plan Overwrite Defense**: The `POST /api/v1/tasks/{task_id}/plan` endpoint is strictly guarded: once a plan is approved or an execution record exists, regeneration is blocked with `409 Conflict`. Pessimistic row locking (`with_for_update(of=Task)`) eliminates race conditions between simultaneous plan regeneration and approval dispatch. When a plan is rejected, regeneration is permitted to produce an alternative plan with a distinct canonical hash, while all prior approval/rejection audit records remain immutable in the database.
   - **Concurrency Protection**: Task row-locking (`with_for_update()`) ensures that parallel approval requests cannot race to queue multiple duplicate executions. Idempotency guarantees safe retries from UI or network dropped connections.
+
+* **Worker Pre-Execution 12-Point Defense-in-Depth Verification (`SecurityExecutionValidator`)**:
+  Before any microVM is provisioned or code executed, the worker re-validates 12 mandatory security criteria:
+  1. Execution state is strictly `queued` or `preparing`.
+  2. Associated `Approval` record exists and decision is `approved`.
+  3. `Approval.approved_plan_hash` matches `Execution.plan_hash`.
+  4. `Execution.plan_snapshot` is present and valid dictionary.
+  5. `plan_snapshot` parses successfully into `TaskPlanSchema`.
+  6. Recomputed SHA-256 hash of `plan_snapshot` matches `Execution.plan_hash`.
+  7. Deterministic policy evaluation returns `allowed == True` with zero violations.
+  8. Step count is bounded within 1 to 3 steps.
+  9. All execution types are strictly `python`.
+  10. Zero-network enforcement (`network_mode == "none"` and `network_required is False`).
+  11. Runtime image is in allowlist (`SANDBOX_ALLOWED_IMAGES`).
+  12. Resource bounds (CPU <= 1, Memory <= 1024MB, Timeout <= 120s) and artifact filename safety.
+
+* **Sandbox Reliability & Teardown Integrity**:
+  - `BaseSandboxAdapter.__aexit__`: Preserves and chains exceptions: if code execution failed and teardown failed, the cleanup exception chains from the execution error (`cleanup_exc from exec_val`). If execution succeeded but teardown failed, `cleanup_exc` is raised.
+  - `MicrosandboxAdapter.destroy()`: Sets `_is_destroyed = True` *only* after confirmed destruction. If destruction raises, `_is_destroyed` remains `False` so cleanup can be retried.
+  - **Missing Artifact Enforcement**: Missing declared expected artifacts raise `ArtifactCollectionError` and transition the execution to `failed`. Artifact errors are never silently swallowed.
 * **Database & Concurrency Isolation**:
   - PostgreSQL integration tests run against a dedicated, isolated test database (`TEST_POSTGRES_DATABASE_URL`). Production database names (`partproof_db`) are hard-blocked by automated guardrails.
   - Schema migrations run through actual Alembic revisions (`alembic upgrade head`) to mirror production DDL and index constraints.

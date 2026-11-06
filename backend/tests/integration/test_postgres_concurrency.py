@@ -14,6 +14,8 @@ from app.models.entities import Approval, Execution, ExecutionEvent, Task, TaskP
 from app.schemas.plan import PlanStepSchema, TaskPlanSchema
 from app.services.orchestration.plan_integrity import compute_plan_hash
 from app.services.policy.engine import DeterministicPolicyEngine
+from app.workers.queue import QueueManager
+from app.workers.leases import LeaseManager
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_DATABASE_URL")
 
@@ -405,3 +407,140 @@ async def test_postgres_concurrent_approval_row_locking():
             assert len(execs2) <= 1
             if execs2:
                 assert execs2[0].status in ("queued", "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_postgres_worker_queue_concurrency():
+    """
+    Verifies PostgreSQL row-level locking (SKIP LOCKED) under concurrent worker queue claiming:
+    1. Seeds multiple queued tasks with approved executions.
+    2. Runs concurrent worker claim calls via asyncio.gather.
+    3. Confirms exactly one worker claims each execution (zero double-claims).
+    4. Validates lease ownership and atomic CAS renewal.
+    """
+    async with postgres_test_context() as (PgTestingSessionLocal, transport):
+        # 1. Seed user
+        async with PgTestingSessionLocal() as session:
+            user = User(
+                email="worker_queue_concurrency@partproof.io",
+                password_hash=get_password_hash("WorkerQueueSecurePass2026!"),
+                role="auditor",
+                is_active=True,
+            )
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+            user_id = user.id
+
+        plan_schema = TaskPlanSchema(
+            title="Parallel Audit Queue Test",
+            summary="Validates SKIP LOCKED concurrency across workers",
+            reasoning_summary="Ensures zero duplicate claims across concurrent worker processes",
+            steps=[
+                PlanStepSchema(
+                    step_id="step_1",
+                    description="Run audit computation",
+                    execution_type="python",
+                    code="print('Audit OK')\n",
+                )
+            ],
+            required_capabilities=["python_execution"],
+            network_required=False,
+            success_criteria=["Complete"],
+            expected_artifacts=["report.csv"],
+        )
+        plan_json = plan_schema.model_dump(mode="json")
+        plan_hash = compute_plan_hash(plan_json)
+
+        # 2. Seed 3 queued tasks with approved executions
+        seeded_task_ids = []
+        seeded_exec_ids = []
+        async with PgTestingSessionLocal() as session:
+            for i in range(3):
+                t = Task(
+                    user_id=user_id,
+                    title=f"Parallel Queue Task {i+1}",
+                    description=f"Task {i+1} for concurrent claim testing",
+                    status="queued",
+                )
+                session.add(t)
+                await session.flush()
+
+                appr = Approval(
+                    task_id=t.id,
+                    approved_by="worker_queue_concurrency@partproof.io",
+                    approved_plan_hash=plan_hash,
+                    decision="approved",
+                )
+                session.add(appr)
+                await session.flush()
+
+                exc = Execution(
+                    task_id=t.id,
+                    approval_id=appr.id,
+                    plan_hash=plan_hash,
+                    plan_snapshot=plan_json,
+                    status="queued",
+                    timeout_seconds=30,
+                )
+                session.add(exc)
+                await session.flush()
+
+                seeded_task_ids.append(t.id)
+                seeded_exec_ids.append(exc.id)
+
+            await session.commit()
+
+        # 3. Launch 3 concurrent workers attempting to claim queued tasks
+        queue_mgr = QueueManager(PgTestingSessionLocal)
+
+        claim_coros = [
+            queue_mgr.claim_next_execution(worker_id=f"worker-concurrent-{i+1}", lease_duration_seconds=60)
+            for i in range(3)
+        ]
+        claimed_results = await asyncio.gather(*claim_coros)
+
+        # All 3 claims must succeed
+        claimed_non_none = [c for c in claimed_results if c is not None]
+        assert len(claimed_non_none) == 3, f"Expected 3 claims, got {len(claimed_non_none)}"
+
+        # Every worker must claim a unique execution (zero duplicate claims)
+        claimed_exec_ids = [c.execution_id for c in claimed_non_none]
+        assert len(set(claimed_exec_ids)) == 3, "Duplicate execution claim detected!"
+        assert set(claimed_exec_ids) == set(seeded_exec_ids)
+
+        # 4. Verify 4th claim returns None (queue empty)
+        fourth_claim = await queue_mgr.claim_next_execution(worker_id="worker-concurrent-4")
+        assert fourth_claim is None
+
+        # 5. Verify database state
+        async with PgTestingSessionLocal() as session:
+            for e_id in seeded_exec_ids:
+                e_rec = await session.get(Execution, e_id)
+                assert e_rec.status == "preparing"
+                assert e_rec.worker_id is not None
+                assert e_rec.lease_expires_at is not None
+                assert e_rec.attempt_count == 1
+
+            for t_id in seeded_task_ids:
+                t_rec = await session.get(Task, t_id)
+                assert t_rec.status == "running"
+
+        # 6. Verify CAS lease renewal ownership on PostgreSQL
+        lease_mgr = LeaseManager(PgTestingSessionLocal)
+        # Owner can renew
+        owner_renew = await lease_mgr.renew_lease(
+            execution_id=claimed_results[0].execution_id,
+            worker_id=claimed_results[0].worker_id,
+            lease_duration_seconds=90,
+        )
+        assert owner_renew is True
+
+        # Non-owner cannot renew
+        non_owner_renew = await lease_mgr.renew_lease(
+            execution_id=claimed_results[0].execution_id,
+            worker_id="worker-imposter",
+            lease_duration_seconds=90,
+        )
+        assert non_owner_renew is False
+
