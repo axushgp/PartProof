@@ -188,3 +188,50 @@ async def test_multi_step_cleanup_failure_handled():
     )
 
     assert res.cleanup_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cumulative_overall_execution_deadline():
+    """
+    Verifies that multiple steps cannot each consume the full overall timeout.
+    The total execution deadline is cumulative; when elapsed time exceeds the
+    configured limit, subsequent steps are aborted with 'timed_out'.
+    """
+    manager = SandboxManager(backend_name="mock")
+
+    steps = [
+        StepExecutionRequest(
+            step_number=1,
+            description="First sleeping step",
+            code="SIMULATE_SLEEP\n",
+            timeout_seconds=5.0,
+        ),
+        StepExecutionRequest(
+            step_number=2,
+            description="Second sleeping step",
+            code="SIMULATE_SLEEP\n",
+            timeout_seconds=5.0,
+        ),
+        StepExecutionRequest(
+            step_number=3,
+            description="Third step should be skipped",
+            code="print('Should never run')\n",
+            timeout_seconds=5.0,
+        ),
+    ]
+
+    # Overall timeout is 1.0s; Step 1 takes 0.6s, leaving only 0.4s for Step 2.
+    # Step 2 needs 0.6s, so the cumulative budget expires.
+    res = await manager.execute_steps(
+        task_id="test-task-cumulative-deadline",
+        execution_id="test-exec-cumulative-deadline",
+        steps=steps,
+        timeout_seconds=1.0,
+    )
+
+    assert res.status == "timed_out"
+    assert res.cleanup_status == "verified_destroyed"
+    assert len(res.step_outputs) == 3
+    # Step 3 must be skipped due to cumulative timeout expiration
+    assert res.step_outputs[2].status == "skipped"
+    assert res.step_outputs[2].exit_code == -1

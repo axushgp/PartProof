@@ -138,6 +138,9 @@ class StepExecutionOutput(BaseModel):
     status: str = Field(default="succeeded", description="'succeeded' | 'failed' | 'timed_out' | 'skipped'")
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    description: str = Field(default="", description="Description of the step")
+    execution_type: str = Field(default="python", description="Execution type, e.g. 'python'")
+    code: Optional[str] = Field(default=None, description="Actual source code executed")
 
 
 class MultiStepExecutionResult(BaseModel):

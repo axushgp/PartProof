@@ -237,11 +237,17 @@ class SandboxManager:
     def active_sandbox_count(self) -> int:
         return len(self._active_sandboxes)
 
+    def generate_sandbox_id(self, task_id: str, execution_id: str) -> str:
+        """Generates a deterministic unique sandbox identifier for isolation tracking."""
+        return f"partproof-{task_id[:8]}-{execution_id[:8]}-{uuid.uuid4().hex[:6]}"
+
     async def execute_steps(
         self,
         task_id: str,
         execution_id: str,
         steps: List[StepExecutionRequest],
+        sandbox_id: Optional[str] = None,
+        on_sandbox_created: Optional[Callable[[str], Coroutine[Any, Any, None]]] = None,
         expected_artifacts: Optional[List[str]] = None,
         image: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
@@ -255,8 +261,10 @@ class SandboxManager:
         Guest filesystem /workspace is preserved across steps.
         If any step fails or times out, execution stops immediately (fail-fast)
         and subsequent steps are marked skipped.
+        Enforces a strict cumulative overall execution deadline across all steps.
         """
-        sandbox_id = f"partproof-{task_id[:8]}-{execution_id[:8]}-{uuid.uuid4().hex[:6]}"
+        sandbox_id = sandbox_id or self.generate_sandbox_id(task_id, execution_id)
+        overall_timeout = timeout_seconds or float(settings.SANDBOX_DEFAULT_TIMEOUT_SECONDS)
 
         config = SandboxConfig(
             sandbox_id=sandbox_id,
@@ -266,7 +274,7 @@ class SandboxManager:
             cpus=cpus or settings.SANDBOX_DEFAULT_CPUS,
             memory_mb=memory_mb or settings.SANDBOX_DEFAULT_MEMORY_MB,
             network="none",
-            timeout_seconds=timeout_seconds or float(settings.SANDBOX_DEFAULT_TIMEOUT_SECONDS),
+            timeout_seconds=overall_timeout,
         )
 
         # Validate security policy for every step
@@ -289,12 +297,17 @@ class SandboxManager:
                 f"execution_id={execution_id} backend={self.backend_name} total_steps={len(steps)}"
             )
 
+            # Persist sandbox identity BEFORE any microVM guest resources are provisioned
+            if on_sandbox_created is not None:
+                await on_sandbox_created(sandbox_id)
+
             overall_status = "succeeded"
             cleanup_status = "pending"
             step_outputs: List[StepExecutionOutput] = []
             artifacts = []
             error_msg: Optional[str] = None
             start_wall_time = time.monotonic()
+            overall_deadline = start_wall_time + overall_timeout
             last_exit_code = 0
             guest_kernel = None
 
@@ -304,8 +317,19 @@ class SandboxManager:
                     failed_or_stopped = False
 
                     for idx, step in enumerate(steps):
-                        # Check cancellation before launching step
-                        if check_cancellation is not None:
+                        # 1. Enforce cumulative execution deadline
+                        remaining_time = overall_deadline - time.monotonic()
+                        if remaining_time <= 0 and not failed_or_stopped:
+                            logger.warning(
+                                f"Overall execution deadline of {overall_timeout}s expired before step {step.step_number}"
+                            )
+                            overall_status = "timed_out"
+                            failed_or_stopped = True
+                            last_exit_code = 124
+                            error_msg = f"Overall execution deadline ({overall_timeout}s) exceeded before step {step.step_number}"
+
+                        # 2. Check cancellation before launching step
+                        if check_cancellation is not None and not failed_or_stopped:
                             try:
                                 is_cancelled = await check_cancellation()
                                 if is_cancelled:
@@ -314,35 +338,45 @@ class SandboxManager:
                                     failed_or_stopped = True
                                     error_msg = "Execution was cancelled by user request."
                             except Exception as ce:
-                                logger.warning(f"Error checking cancellation: {ce}")
+                                logger.error(f"Error checking cancellation before step {step.step_number}: {ce}. Failing closed.")
+                                overall_status = "failed"
+                                failed_or_stopped = True
+                                error_msg = f"Cancellation check failed closed: {ce}"
 
                         if failed_or_stopped:
-                            # Skip this and all remaining steps
+                            # Skip this and all remaining steps, preserving full step metadata
                             skipped_output = StepExecutionOutput(
                                 step_number=step.step_number,
                                 stdout="",
-                                stderr="Skipped due to prior failure or cancellation.",
+                                stderr="Skipped due to prior failure, timeout, or cancellation.",
                                 exit_code=-1,
                                 duration_seconds=0.0,
                                 status="skipped",
                                 started_at=datetime.now(timezone.utc),
                                 completed_at=datetime.now(timezone.utc),
+                                description=step.description,
+                                execution_type=step.execution_type,
+                                code=step.code,
                             )
                             step_outputs.append(skipped_output)
                             if on_step_complete is not None:
                                 try:
                                     await on_step_complete(step.step_number, skipped_output)
                                 except Exception as cb_err:
-                                    logger.error(f"Callback on_step_complete failed for step {step.step_number}: {cb_err}")
+                                    logger.error(f"Callback on_step_complete failed for skipped step {step.step_number}: {cb_err}")
+                                    raise
                             continue
 
-                        # Execute active step
+                        # 3. Bound step timeout by remaining overall deadline
+                        step_configured_timeout = step.timeout_seconds or overall_timeout
+                        effective_step_timeout = max(0.1, min(step_configured_timeout, remaining_time))
+
                         step_filename = step.filename or f"step_{step.step_number}.py"
                         step_req = ExecutionRequest(
                             code=step.code,
                             filename=step_filename,
                             expected_artifacts=[],
-                            timeout_seconds=step.timeout_seconds or config.timeout_seconds,
+                            timeout_seconds=effective_step_timeout,
                         )
 
                         step_start = datetime.now(timezone.utc)
@@ -377,7 +411,7 @@ class SandboxManager:
                             overall_status = "timed_out"
                             failed_or_stopped = True
                             last_exit_code = 124
-                            step_duration = config.timeout_seconds
+                            step_duration = effective_step_timeout
                             step_stderr = f"Step timed out: {te.message}\n"
                             error_msg = f"Step {step.step_number} timed out: {te}"
 
@@ -400,6 +434,9 @@ class SandboxManager:
                             status=step_status,
                             started_at=step_start,
                             completed_at=step_finish,
+                            description=step.description,
+                            execution_type=step.execution_type,
+                            code=step.code,
                         )
                         step_outputs.append(recorded_step)
 
@@ -408,19 +445,29 @@ class SandboxManager:
                                 await on_step_complete(step.step_number, recorded_step)
                             except Exception as cb_err:
                                 logger.error(f"Callback on_step_complete failed for step {step.step_number}: {cb_err}")
+                                failed_or_stopped = True
+                                overall_status = "failed"
+                                error_msg = f"Step persistence callback failed: {cb_err}"
+                                raise
 
-                    # Collect artifacts if plan succeeded
+                    # Collect artifacts if plan succeeded and overall deadline has not expired
                     if overall_status == "succeeded" and expected_artifacts:
-                        try:
-                            artifacts = await adapter.collect_artifacts(
-                                expected_artifacts,
-                                str(dest_dir),
-                            )
-                        except Exception as art_err:
-                            logger.error(f"Artifact collection failed: {art_err}", exc_info=True)
-                            overall_status = "failed"
-                            last_exit_code = 1
-                            error_msg = f"Artifact collection failed: {art_err}"
+                        if time.monotonic() > overall_deadline:
+                            logger.warning("Overall execution deadline expired before artifact collection")
+                            overall_status = "timed_out"
+                            last_exit_code = 124
+                            error_msg = "Overall execution deadline expired before artifact collection completed"
+                        else:
+                            try:
+                                artifacts = await adapter.collect_artifacts(
+                                    expected_artifacts,
+                                    str(dest_dir),
+                                )
+                            except Exception as art_err:
+                                logger.error(f"Artifact collection failed: {art_err}", exc_info=True)
+                                overall_status = "failed"
+                                last_exit_code = 1
+                                error_msg = f"Artifact collection failed: {art_err}"
 
                 cleanup_status = "verified_destroyed"
 

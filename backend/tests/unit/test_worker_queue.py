@@ -408,19 +408,26 @@ async def test_execution_worker_process_claimed_task_end_to_end(db_session: Asyn
         await db_session.refresh(task)
         await db_session.refresh(execution)
 
-        assert task.status == "completed"
+        assert task.status == "succeeded"
         assert execution.status == "succeeded"
+        assert execution.sandbox_id is not None
+        assert execution.sandbox_id.startswith("partproof-")
         assert execution.cleanup_status == "verified_destroyed"
         assert execution.duration_seconds is not None
         assert execution.duration_seconds > 0
+        assert execution.lease_expires_at is None
 
-        # Verify steps persisted
+        # Verify steps persisted with full metadata
         steps_stmt = select(ExecutionStep).where(ExecutionStep.execution_id == execution.id).order_by(ExecutionStep.step_number)
         steps_res = await db_session.execute(steps_stmt)
         steps = steps_res.scalars().all()
         assert len(steps) == 2
         assert steps[0].status == "succeeded"
+        assert steps[0].description == "Parse items and verify prices"
+        assert steps[0].code is not None
+        assert steps[0].execution_type == "python"
         assert steps[1].status == "succeeded"
+        assert steps[1].description == "Generate summary report"
 
         # Verify artifacts persisted
         art_stmt = select(Artifact).where(Artifact.execution_id == execution.id)
@@ -437,11 +444,179 @@ async def test_execution_worker_process_claimed_task_end_to_end(db_session: Asyn
         event_types = [e.event_type for e in events]
         assert "execution_claimed" in event_types
         assert "execution_started" in event_types
+        assert "sandbox_allocated" in event_types
         assert "execution_step_completed" in event_types
-        assert "execution_completed" in event_types
+        assert "execution_succeeded" in event_types
     finally:
         if os.path.exists(lock_file):
             try:
                 os.remove(lock_file)
             except Exception:
                 pass
+
+
+@pytest.mark.asyncio
+async def test_sandbox_identity_persisted_before_provisioning_and_crash_recovery(db_session: AsyncSession):
+    """
+    Simulates a worker crashing immediately after sandbox identity is persisted and provisioned.
+    Proves that Execution.sandbox_id was recorded in the database, allowing the reconciler
+    to detect the orphaned microVM, verify its absence, and cleanly requeue the execution.
+    """
+    from app.workers.execution_worker import ExecutionWorker
+
+    session_factory = MockSessionFactory(db_session)
+    user = User(email="crash-test@partproof.io", password_hash="dummy")
+    db_session.add(user)
+    await db_session.flush()
+
+    plan_dict = copy.deepcopy(VALID_PLAN_DICT)
+    plan_hash = compute_plan_hash(plan_dict)
+
+    task = Task(user_id=user.id, title="Crash Recovery Task", description="Simulate crash", status="queued")
+    db_session.add(task)
+    await db_session.flush()
+
+    approval = Approval(task_id=task.id, approved_by=user.email, approved_plan_hash=plan_hash, decision="approved")
+    db_session.add(approval)
+    await db_session.flush()
+
+    execution = Execution(
+        task_id=task.id,
+        approval_id=approval.id,
+        plan_hash=plan_hash,
+        plan_snapshot=plan_dict,
+        status="queued",
+        timeout_seconds=30,
+    )
+    db_session.add(execution)
+    await db_session.commit()
+
+    # Step 1: Claim execution
+    queue_mgr = QueueManager(session_factory)
+    claimed = await queue_mgr.claim_next_execution("crashing-worker", lease_duration_seconds=1, max_attempts=3)
+    assert claimed is not None
+
+    # Step 2: Worker allocates and persists sandbox_id before provisioning
+    worker = ExecutionWorker(session_factory=session_factory, worker_id="crashing-worker")
+    sandbox_id = worker.sandbox_manager.generate_sandbox_id(task.id, execution.id)
+
+    # Worker records sandbox_id and starts running
+    execution.sandbox_id = sandbox_id
+    execution.status = "running"
+    # Worker crashes! Lease expires immediately:
+    execution.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    await db_session.commit()
+
+    # Verify that before reconciliation, sandbox_id is safely stored in database
+    await db_session.refresh(execution)
+    assert execution.sandbox_id == sandbox_id
+    assert execution.status == "running"
+
+    # Step 3: StaleExecutionReconciler runs and reconciles the orphaned execution
+    reconciler = StaleExecutionReconciler(session_factory)
+    reconciled_count = await reconciler.reconcile_stale_executions(max_attempts=3)
+    assert reconciled_count == 1
+
+    await db_session.refresh(execution)
+    await db_session.refresh(task)
+    assert execution.status == "queued"
+    assert execution.cleanup_status == "verified_destroyed"
+    assert execution.worker_id is None
+    assert task.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_old_worker_cannot_overwrite_state_of_replacement_worker(db_session: AsyncSession):
+    """
+    Proves that an old worker that lost ownership cannot overwrite the state of a replacement worker.
+    """
+    from app.workers.execution_worker import ExecutionWorker
+    from app.services.sandbox.base import MultiStepExecutionResult
+
+    session_factory = MockSessionFactory(db_session)
+    user = User(email="ownership-test@partproof.io", password_hash="dummy")
+    db_session.add(user)
+    await db_session.flush()
+
+    plan_dict = copy.deepcopy(VALID_PLAN_DICT)
+    plan_hash = compute_plan_hash(plan_dict)
+
+    task = Task(user_id=user.id, title="Ownership Guard Task", description="Testing worker CAS", status="running")
+    db_session.add(task)
+    await db_session.flush()
+
+    # Execution was reassigned to replacement-worker-02
+    execution = Execution(
+        task_id=task.id,
+        plan_hash=plan_hash,
+        plan_snapshot=plan_dict,
+        status="running",
+        worker_id="replacement-worker-02",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+    )
+    db_session.add(execution)
+    await db_session.commit()
+
+    # Old worker (worker-01) tries to finalize execution or persist output
+    old_worker = ExecutionWorker(session_factory=session_factory, worker_id="worker-01")
+
+    # Finalization must be rejected because worker_id doesn't match
+    dummy_result = MultiStepExecutionResult(
+        task_id=task.id,
+        execution_id=execution.id,
+        sandbox_id="sb-old",
+        status="succeeded",
+        step_outputs=[],
+        artifacts=[],
+        cleanup_status="verified_destroyed",
+        execution_mode="mock",
+        duration_seconds=1.5,
+        exit_code=0,
+    )
+    await old_worker._finalize_execution(execution.id, task.id, dummy_result)
+
+    await db_session.refresh(execution)
+    await db_session.refresh(task)
+    # Execution remains owned by replacement-worker-02 with running status
+    assert execution.worker_id == "replacement-worker-02"
+    assert execution.status == "running"
+    assert task.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_unverified_sandbox_cleanup_marks_needs_reconciliation(db_session: AsyncSession):
+    """
+    Proves that when microVM absence cannot be established, the execution transitions
+    to 'needs_reconciliation' and is NEVER requeued.
+    """
+    session_factory = MockSessionFactory(db_session)
+    user = User(email="leak-test@partproof.io", password_hash="dummy")
+    db_session.add(user)
+    await db_session.flush()
+
+    task = Task(user_id=user.id, title="Unverified Teardown Task", description="Leak test", status="running")
+    db_session.add(task)
+    await db_session.flush()
+
+    execution = Execution(
+        task_id=task.id,
+        status="running",
+        worker_id="crashed-worker",
+        sandbox_id="leaked-microvm-001",
+        lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=30),
+    )
+    db_session.add(execution)
+    await db_session.commit()
+
+    reconciler = StaleExecutionReconciler(session_factory)
+    # Simulate failed absence verification
+    reconciler._force_cleanup_unverified = True
+
+    count = await reconciler.reconcile_stale_executions(max_attempts=3)
+    assert count == 1
+
+    await db_session.refresh(execution)
+    await db_session.refresh(task)
+    assert execution.status == "needs_reconciliation"
+    assert execution.cleanup_status == "leak_detected"
+    assert task.status == "needs_reconciliation"

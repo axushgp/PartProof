@@ -1,15 +1,15 @@
 [Unit]
 Description=PartProof Background Execution Worker (Vultr Microsandbox)
-After=network.target postgresql.service docker.service
-Wants=postgresql.service
+After=network.target docker.service
+Wants=docker.service
 
 [Service]
 Type=simple
 User=linuxuser
 Group=linuxuser
-WorkingDirectory=/home/linuxuser/partproof/backend
-EnvironmentFile=/home/linuxuser/partproof/backend/.env
-ExecStart=/home/linuxuser/partproof/backend/.venv/bin/python -m app.workers.execution_worker
+WorkingDirectory=/home/linuxuser/PartProof/backend
+EnvironmentFile=/home/linuxuser/PartProof/backend/.env
+ExecStart=/home/linuxuser/PartProof/backend/.venv/bin/python -m app.workers.execution_worker
 
 # Concurrency & file limits
 LimitNOFILE=65536

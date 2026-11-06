@@ -85,7 +85,10 @@ class MockSandboxAdapter(BaseSandboxAdapter):
             )
 
         # 3. Standard successful deterministic execution simulation
-        await asyncio.sleep(0.02)
+        if "SIMULATE_SLEEP" in request.code:
+            await asyncio.sleep(0.6)
+        else:
+            await asyncio.sleep(0.02)
         elapsed = time.monotonic() - start_time
 
         stdout_text = (

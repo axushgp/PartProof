@@ -135,3 +135,250 @@ print(f"Step 2 processed {len(items)} items. Total cost: {total_cost}")
     msb_list = subprocess.run(["msb", "ls"], capture_output=True, text=True)
     if msb_list.returncode == 0:
         assert result.sandbox_id not in msb_list.stdout
+
+
+@pytest.mark.asyncio
+async def test_real_microsandbox_execution_worker_with_postgres(tmp_path):
+    """
+    True end-to-end persistent worker integration test with real PostgreSQL and real Microsandbox:
+    1. Seed approved plan in the dedicated PostgreSQL test database (partproof_test).
+    2. Create a queued Execution.
+    3. Start the actual ExecutionWorker in run-once mode.
+    4. Verify PostgreSQL queue claiming and worker ownership.
+    5. Verify sandbox identity is persisted before execution.
+    6. Execute at least two steps inside the same real microVM.
+    7. Verify workspace persistence across steps.
+    8. Verify step records and artifacts in PostgreSQL.
+    9. Verify sandbox destruction via CLI.
+    10. Verify Task and Execution terminal states ('succeeded').
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from app.core.config import settings
+    from app.models.entities import Approval, Artifact, Execution, ExecutionEvent, ExecutionStep, Task, User
+    from app.services.orchestration.plan_integrity import compute_plan_hash
+    from app.workers.execution_worker import ExecutionWorker
+    from app.workers.host_lock import HostLock
+    from tests.integration.test_postgres_concurrency import (
+        TEST_POSTGRES_URL,
+        postgres_test_context,
+        validate_test_database_url,
+    )
+
+    if not TEST_POSTGRES_URL:
+        pytest.skip("Requires TEST_POSTGRES_DATABASE_URL to be set for PostgreSQL worker integration test")
+
+    validate_test_database_url(TEST_POSTGRES_URL)
+
+    step1_code = """
+import csv
+data = [["part_id", "qty", "price"], ["HEX-01", 10, 2.50], ["HEX-02", 5, 8.00]]
+with open("/workspace/parts.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerows(data)
+print("WROTE_PARTS_CSV")
+"""
+    step2_code = """
+import csv
+import os
+assert os.path.exists("/workspace/parts.csv"), "Missing parts.csv!"
+total = 0.0
+with open("/workspace/parts.csv", "r") as f:
+    reader = csv.DictReader(f)
+    for r in reader:
+        total += int(r["qty"]) * float(r["price"])
+os.makedirs("/workspace/output", exist_ok=True)
+with open("/workspace/output/audit_receipt.csv", "w", newline="") as f:
+    f.write(f"total_cost\\n{total}\\n")
+print(f"CALCULATED_TOTAL:{total}")
+"""
+
+    plan_dict = {
+        "title": "Real Worker End-to-End Test",
+        "summary": "Validates persistent worker with live PostgreSQL and real microVM",
+        "reasoning_summary": "Tests full multi-step persistent pipeline",
+        "steps": [
+            {"step_id": "step_1", "description": "Extract raw parts", "execution_type": "python", "code": step1_code},
+            {"step_id": "step_2", "description": "Calculate audit total", "execution_type": "python", "code": step2_code},
+        ],
+        "required_capabilities": ["file_read", "file_write"],
+        "network_required": False,
+        "success_criteria": ["Receipt generated"],
+        "expected_artifacts": ["audit_receipt.csv"],
+    }
+    plan_hash = compute_plan_hash(plan_dict)
+
+    async with postgres_test_context() as SessionFactory:
+        async with SessionFactory() as session:
+            # 1. Seed user and task
+            user = User(email="real-worker-test@partproof.io", password_hash="dummy")
+            session.add(user)
+            await session.flush()
+
+            task = Task(user_id=user.id, title="Live Worker Pipeline Task", description="PostgreSQL E2E", status="queued")
+            session.add(task)
+            await session.flush()
+
+            approval = Approval(
+                task_id=task.id,
+                approved_by=user.email,
+                approved_plan_hash=plan_hash,
+                decision="approved",
+            )
+            session.add(approval)
+            await session.flush()
+
+            execution = Execution(
+                task_id=task.id,
+                approval_id=approval.id,
+                plan_hash=plan_hash,
+                plan_snapshot=plan_dict,
+                status="queued",
+                runtime_image="python:3.12-slim",
+                cpu_limit=1,
+                memory_limit_mb=512,
+                network_mode="none",
+                timeout_seconds=60,
+            )
+            session.add(execution)
+            await session.commit()
+            exec_id = execution.id
+            task_id = task.id
+
+        # 2. Run ExecutionWorker
+        art_manager = ArtifactManager(base_storage_dir=str(tmp_path / "artifacts"))
+        sb_manager = SandboxManager(backend_name="microsandbox", artifact_manager=art_manager)
+        worker = ExecutionWorker(
+            session_factory=SessionFactory,
+            sandbox_manager=sb_manager,
+            artifact_manager=art_manager,
+            worker_id="real-worker-integration-01",
+        )
+        lock_path = str(tmp_path / "partproof_worker_test.lock")
+        worker.host_lock = HostLock(lock_path)
+
+        await worker.run(run_once=True)
+
+        # 3. Assertions against PostgreSQL
+        async with SessionFactory() as session:
+            db_exec = await session.get(Execution, exec_id)
+            db_task = await session.get(Task, task_id)
+
+            assert db_task is not None
+            assert db_exec is not None
+
+            # Terminal states must be canonical 'succeeded'
+            assert db_task.status == "succeeded"
+            assert db_exec.status == "succeeded"
+            assert db_exec.cleanup_status == "verified_destroyed"
+            assert db_exec.exit_code == 0
+            assert db_exec.duration_seconds is not None and db_exec.duration_seconds > 0
+
+            # Sandbox identity was persisted in PostgreSQL
+            assert db_exec.sandbox_id is not None
+            assert db_exec.sandbox_id.startswith("partproof-")
+
+            # Worker ownership was recorded
+            assert db_exec.worker_id == "real-worker-integration-01"
+            assert db_exec.lease_expires_at is None
+
+            # Step records
+            steps_stmt = select(ExecutionStep).where(ExecutionStep.execution_id == exec_id).order_by(ExecutionStep.step_number)
+            steps = (await session.execute(steps_stmt)).scalars().all()
+            assert len(steps) == 2
+            assert steps[0].status == "succeeded"
+            assert steps[0].exit_code == 0
+            assert "WROTE_PARTS_CSV" in (steps[0].stdout or "")
+            assert steps[1].status == "succeeded"
+            assert steps[1].exit_code == 0
+            assert "CALCULATED_TOTAL:65.0" in (steps[1].stdout or "")
+
+            # Artifact persisted
+            art_stmt = select(Artifact).where(Artifact.execution_id == exec_id)
+            arts = (await session.execute(art_stmt)).scalars().all()
+            assert len(arts) == 1
+            assert arts[0].filename == "audit_receipt.csv"
+            assert os.path.exists(arts[0].storage_key)
+
+            # Verification of microVM absence via msb ls
+            msb_list = subprocess.run(["msb", "ls"], capture_output=True, text=True)
+            if msb_list.returncode == 0:
+                assert db_exec.sandbox_id not in msb_list.stdout
+
+
+@pytest.mark.asyncio
+async def test_real_microsandbox_stale_recovery_with_postgres(tmp_path):
+    """
+    Tests stale execution recovery with PostgreSQL:
+    - Verifies an execution whose lease expired with verified cleanup is safely requeued.
+    - Verifies an execution whose microVM cannot be proven destroyed transitions to needs_reconciliation.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.models.entities import Execution, Task, User
+    from app.workers.recovery import StaleExecutionReconciler
+    from tests.integration.test_postgres_concurrency import (
+        TEST_POSTGRES_URL,
+        postgres_test_context,
+        validate_test_database_url,
+    )
+
+    if not TEST_POSTGRES_URL:
+        pytest.skip("Requires TEST_POSTGRES_DATABASE_URL to be set for PostgreSQL worker integration test")
+
+    validate_test_database_url(TEST_POSTGRES_URL)
+
+    async with postgres_test_context() as SessionFactory:
+        reconciler = StaleExecutionReconciler(SessionFactory)
+
+        async with SessionFactory() as session:
+            user = User(email="stale-test@partproof.io", password_hash="dummy")
+            session.add(user)
+            await session.flush()
+
+            # Case 1: Stale execution with confirmed absent sandbox (sandbox already stopped)
+            task1 = Task(user_id=user.id, title="Stale Task 1", description="Requeue test", status="running")
+            session.add(task1)
+            await session.flush()
+
+            exec1 = Execution(
+                task_id=task1.id,
+                status="running",
+                worker_id="dead-worker-01",
+                sandbox_id="already-absent-sandbox-id-9999",
+                lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+                attempt_count=1,
+            )
+            session.add(exec1)
+
+            # Case 2: Stale execution where microVM cannot be confirmed destroyed
+            task2 = Task(user_id=user.id, title="Stale Task 2", description="Leak test", status="running")
+            session.add(task2)
+            await session.flush()
+
+            exec2 = Execution(
+                task_id=task2.id,
+                status="running",
+                worker_id="dead-worker-02",
+                sandbox_id="unverified-leak-sandbox-id-8888",
+                lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+                attempt_count=1,
+            )
+            session.add(exec2)
+            await session.commit()
+            e1_id, e2_id = exec1.id, exec2.id
+            t1_id, t2_id = task1.id, task2.id
+
+        # Reconcile Case 1 (sandbox absent -> requeue)
+        # Note: 'already-absent-sandbox-id-9999' will not be found in 'msb ls', proving absence!
+        reconciled = await reconciler.reconcile_stale_executions(max_attempts=3)
+        assert reconciled >= 1
+
+        async with SessionFactory() as session:
+            res_e1 = await session.get(Execution, e1_id)
+            res_t1 = await session.get(Task, t1_id)
+            assert res_e1 is not None and res_t1 is not None
+            # Confirmed absent -> requeued safely
+            assert res_e1.status == "queued"
+            assert res_t1.status == "queued"
+            assert res_e1.cleanup_status == "verified_destroyed"
+            assert res_e1.worker_id is None

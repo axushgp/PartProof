@@ -106,7 +106,13 @@ class LeaseManager:
                                 logger.error("Error in on_lease_lost callback: %s", cb_err)
                         break
                 except Exception as e:
-                    logger.error("Exception during lease renewal for %s: %s", execution_id, e)
+                    logger.error("Exception during lease renewal for %s: %s. Failing closed.", execution_id, e)
+                    if on_lease_lost:
+                        try:
+                            await on_lease_lost()
+                        except Exception as cb_err:
+                            logger.error("Error in on_lease_lost callback: %s", cb_err)
+                    break
 
             logger.info("Heartbeat loop terminated for execution %s", execution_id)
 
