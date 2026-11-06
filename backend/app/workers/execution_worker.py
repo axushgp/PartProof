@@ -173,44 +173,58 @@ class ExecutionWorker:
                 logger.error("Execution %s not found in database during pre-execution check", execution_id)
                 return
 
-            # Verify worker ownership and active lease before preparing -> running
-            if execution.worker_id != self.worker_id:
-                logger.warning(
-                    "Worker %s lost ownership of execution %s before execution (current worker: %s)",
-                    self.worker_id,
-                    execution_id,
-                    execution.worker_id,
-                )
-                return
-
-            if execution.lease_expires_at and _ensure_utc(execution.lease_expires_at) < now:
-                logger.warning("Lease expired for execution %s before execution began", execution_id)
-                return
-
             approval = execution.approval
             try:
                 plan_schema = self.validator.validate(execution, approval)
             except SecurityValidationError as sve:
                 logger.error("Security validation rejected execution %s: %s", execution_id, sve.message)
-                execution.status = "failed"
-                execution.lease_expires_at = None
-                if execution.task:
-                    execution.task.status = "failed"
-                session.add(
-                    ExecutionEvent(
-                        task_id=task_id,
-                        execution_id=execution_id,
-                        event_type="execution_failed",
-                        message=f"Pre-execution security validation failed: {sve.message}",
-                        metadata_json={"violations": sve.violations},
+                # Atomic conditional update requiring ownership, preparing status, and unexpired lease
+                update_stmt = (
+                    update(Execution)
+                    .where(
+                        Execution.id == execution_id,
+                        Execution.worker_id == self.worker_id,
+                        Execution.status == "preparing",
+                        Execution.lease_expires_at > now,
                     )
+                    .values(status="failed", lease_expires_at=None)
                 )
-                await session.commit()
+                upd_res = await session.execute(update_stmt)
+                if upd_res.rowcount > 0:
+                    if execution.task:
+                        execution.task.status = "failed"
+                    session.add(
+                        ExecutionEvent(
+                            task_id=task_id,
+                            execution_id=execution_id,
+                            event_type="execution_failed",
+                            message=f"Pre-execution security validation failed: {sve.message}",
+                            metadata_json={"violations": sve.violations},
+                        )
+                    )
+                    await session.commit()
                 return
 
-            # Persist sandbox identity and transition from preparing to running with ownership check
-            execution.sandbox_id = sandbox_id
-            execution.status = "running"
+            # Atomic conditional update transitioning preparing -> running
+            update_stmt = (
+                update(Execution)
+                .where(
+                    Execution.id == execution_id,
+                    Execution.worker_id == self.worker_id,
+                    Execution.status == "preparing",
+                    Execution.lease_expires_at > now,
+                )
+                .values(status="running", sandbox_id=sandbox_id)
+            )
+            upd_res = await session.execute(update_stmt)
+            if upd_res.rowcount == 0:
+                logger.warning(
+                    "Worker %s lost ownership or lease expired before starting execution %s",
+                    self.worker_id,
+                    execution_id,
+                )
+                return
+
             session.add(
                 ExecutionEvent(
                     task_id=task_id,
@@ -351,21 +365,41 @@ class ExecutionWorker:
     ) -> None:
         """
         Persists each step output immediately into PostgreSQL upon step completion.
-        Preserves full step metadata (description, execution_type, code, attempt_number).
-        Fails closed on database errors.
+        Enforces worker ID, active execution status ('running'), and unexpired lease.
+        A worker that loses its lease must not persist steps, events, or artifacts.
         """
         async with self.session_factory() as session:
-            # Check ownership before writing step record
-            exec_rec = await session.get(Execution, execution_id)
-            if not exec_rec or exec_rec.worker_id != self.worker_id:
+            now = datetime.now(timezone.utc)
+            dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+            is_postgres = "postgres" in dialect_name
+
+            # Row lock / conditional verification of ownership, active running status, and valid lease
+            stmt = (
+                select(Execution)
+                .where(
+                    Execution.id == execution_id,
+                    Execution.worker_id == self.worker_id,
+                    Execution.status == "running",
+                    Execution.lease_expires_at > now,
+                )
+            )
+            if is_postgres:
+                stmt = stmt.with_for_update(of=Execution)
+
+            res = await session.execute(stmt)
+            exec_rec = res.scalar_one_or_none()
+
+            if not exec_rec:
                 logger.warning(
-                    "Worker %s lost ownership of execution %s during step %d output persistence",
+                    "Worker %s lost ownership, active status, or unexpired lease for execution %s during step %d output persistence. Mutation aborted.",
                     self.worker_id,
                     execution_id,
                     output.step_number,
                 )
                 self._execution_cancelled = True
-                raise RuntimeError(f"Worker {self.worker_id} lost ownership before persisting step {output.step_number}")
+                raise RuntimeError(
+                    f"Worker {self.worker_id} lost ownership, active status, or lease for execution {execution_id} before persisting step {output.step_number}"
+                )
 
             step_record = ExecutionStep(
                 execution_id=execution_id,
@@ -409,136 +443,130 @@ class ExecutionWorker:
     ) -> None:
         """
         Atomically updates Execution and Task to terminal states, registers artifacts, and logs events.
-        Enforces strict worker ownership checks: if ownership was lost to a replacement worker,
-        skips updates to avoid overwriting newer state.
-        Uses canonical terminal success state 'succeeded'.
-        Does NOT mark execution successful if cleanup failed.
-        Clears lease fields upon terminal transition.
+        Enforces atomic worker ownership, active execution status ('running'), and unexpired lease.
+        A worker that loses its lease must not persist terminal states, artifacts, or events.
+
+        CRITICAL SAFETY INVARIANT:
+        If cleanup_status != verified_destroyed, NEVER finalize as succeeded, failed, or cancelled.
+        Preserve sandbox identity and transition to needs_reconciliation.
+        Covers the result is None, cancelled, timed_out, and failed execution paths.
         """
         async with self.session_factory() as session:
-            exec_rec = await session.get(Execution, execution_id)
-            task_rec = await session.get(Task, task_id)
-            if not exec_rec or not task_rec:
-                return
+            now = datetime.now(timezone.utc)
+            cleanup_status = result.cleanup_status if result else "pending_cleanup"
 
-            # Ownership check: an old worker must NOT overwrite state written by a replacement worker
-            if exec_rec.worker_id != self.worker_id:
+            # 1. Evaluate target states adhering strictly to cleanup safety invariants
+            if cleanup_status != "verified_destroyed":
+                # MicroVM destruction could not be independently established.
+                # Must NEVER finalize as succeeded, failed, or cancelled.
+                # Preserve sandbox identity and transition to needs_reconciliation!
+                target_status = "needs_reconciliation"
+                task_status = "needs_reconciliation"
+                final_cleanup_status = "leak_detected" if cleanup_status in ("failed", "pending_cleanup", "pending") else cleanup_status
+                event_type = "execution_needs_reconciliation"
+                event_msg = (
+                    f"Execution terminated with unverified microVM cleanup ({cleanup_status}). "
+                    f"Preserved sandbox identity for background reconciliation."
+                )
+            elif result is None:
+                # Unexpected lifecycle exception, but cleanup was verified
+                target_status = "failed"
+                task_status = "failed"
+                final_cleanup_status = "verified_destroyed"
+                event_type = "execution_failed"
+                event_msg = "Execution failed: unhandled exception during microVM lifecycle."
+            elif result.status == "cancelled" or self._execution_cancelled or self._stop_requested:
+                target_status = "cancelled"
+                task_status = "cancelled"
+                final_cleanup_status = "verified_destroyed"
+                event_type = "execution_cancelled"
+                event_msg = "Execution cancelled."
+            elif result.status == "succeeded":
+                target_status = "succeeded"
+                task_status = "succeeded"
+                final_cleanup_status = "verified_destroyed"
+                event_type = "execution_succeeded"
+                event_msg = f"Execution succeeded in {result.duration_seconds}s."
+            elif result.status == "timed_out":
+                target_status = "timed_out"
+                task_status = "failed"
+                final_cleanup_status = "verified_destroyed"
+                event_type = "execution_timed_out"
+                event_msg = result.error_message or "Execution timed out."
+            else:
+                target_status = "failed"
+                task_status = "failed"
+                final_cleanup_status = "verified_destroyed"
+                event_type = "execution_failed"
+                event_msg = result.error_message or "Execution failed with non-zero exit code."
+
+            # 2. Atomic conditional SQL update checking worker_id, active running status, AND unexpired lease
+            stmt = (
+                update(Execution)
+                .where(
+                    Execution.id == execution_id,
+                    Execution.worker_id == self.worker_id,
+                    Execution.status == "running",
+                    Execution.lease_expires_at > now,
+                )
+                .values(
+                    status=target_status,
+                    completed_at=now,
+                    duration_seconds=result.duration_seconds if result else None,
+                    exit_code=result.exit_code if result else 1,
+                    cleanup_status=final_cleanup_status,
+                    guest_kernel=result.guest_kernel if result else None,
+                    lease_expires_at=None,
+                )
+            )
+            res = await session.execute(stmt)
+
+            if res.rowcount == 0:
                 logger.warning(
-                    "Worker %s lost ownership of execution %s (current worker: %s). "
-                    "Skipping finalization to prevent overwriting replacement worker state.",
+                    "Worker %s lost ownership, active status, or unexpired lease for execution %s during finalization. "
+                    "Finalization aborted: no steps, artifacts, events, or terminal states persisted.",
                     self.worker_id,
                     execution_id,
-                    exec_rec.worker_id,
                 )
                 return
 
-            now = datetime.now(timezone.utc)
-            exec_rec.completed_at = now
-            exec_rec.lease_expires_at = None
+            # 3. Only mutate Task, add artifacts, and record events if the atomic update affected exactly the claimed row!
+            task_rec = await session.get(Task, task_id)
+            if task_rec:
+                task_rec.status = task_status
 
-            if result is None:
-                exec_rec.status = "failed"
-                task_rec.status = "failed"
-                exec_rec.cleanup_status = "pending_cleanup"
-                session.add(
-                    ExecutionEvent(
-                        task_id=task_id,
-                        execution_id=execution_id,
-                        event_type="execution_failed",
-                        message="Execution failed: unhandled exception during microVM lifecycle.",
-                    )
+            session.add(
+                ExecutionEvent(
+                    task_id=task_id,
+                    execution_id=execution_id,
+                    event_type=event_type,
+                    message=event_msg,
+                    metadata_json={
+                        "duration_seconds": result.duration_seconds if result else None,
+                        "cleanup_status": final_cleanup_status,
+                        "target_status": target_status,
+                    },
                 )
-                await session.commit()
-                return
+            )
 
-            exec_rec.duration_seconds = result.duration_seconds
-            exec_rec.exit_code = result.exit_code
-            exec_rec.cleanup_status = result.cleanup_status
-            exec_rec.guest_kernel = result.guest_kernel
-
-            # Status resolution
-            if result.status == "cancelled" or exec_rec.status == "cancel_requested" or task_rec.status == "cancel_requested":
-                exec_rec.status = "cancelled"
-                task_rec.status = "cancelled"
-                session.add(
-                    ExecutionEvent(
-                        task_id=task_id,
-                        execution_id=execution_id,
-                        event_type="execution_cancelled",
-                        message="Execution cancelled.",
-                    )
-                )
-            elif result.status == "succeeded":
-                # Invariant: Do NOT mark an execution successful if cleanup failed
-                if result.cleanup_status != "verified_destroyed":
-                    logger.error(
-                        "Execution %s succeeded steps but cleanup status is '%s'. Marking failed.",
-                        execution_id,
-                        result.cleanup_status,
-                    )
-                    exec_rec.status = "failed"
-                    task_rec.status = "failed"
-                    session.add(
-                        ExecutionEvent(
-                            task_id=task_id,
-                            execution_id=execution_id,
-                            event_type="execution_failed",
-                            message=f"Execution completed steps successfully, but microVM cleanup failed ({result.cleanup_status}).",
-                            metadata_json={"cleanup_status": result.cleanup_status},
-                        )
-                    )
-                else:
-                    exec_rec.status = "succeeded"
-                    task_rec.status = "succeeded"
-                    session.add(
-                        ExecutionEvent(
-                            task_id=task_id,
-                            execution_id=execution_id,
-                            event_type="execution_succeeded",
-                            message=f"Execution succeeded in {result.duration_seconds}s.",
-                            metadata_json={"duration_seconds": result.duration_seconds, "artifacts_count": len(result.artifacts)},
-                        )
-                    )
-            elif result.status == "timed_out":
-                exec_rec.status = "timed_out"
-                task_rec.status = "failed"
-                session.add(
-                    ExecutionEvent(
-                        task_id=task_id,
-                        execution_id=execution_id,
-                        event_type="execution_timed_out",
-                        message=result.error_message or "Execution timed out.",
-                    )
-                )
-            else:
-                exec_rec.status = "failed"
-                task_rec.status = "failed"
-                session.add(
-                    ExecutionEvent(
-                        task_id=task_id,
-                        execution_id=execution_id,
-                        event_type="execution_failed",
-                        message=result.error_message or "Execution failed with non-zero exit code.",
-                    )
-                )
-
-            # Register artifacts only if execution succeeded
-            if exec_rec.status == "succeeded":
+            # Register artifacts ONLY IF target_status == 'succeeded' and cleanup was confirmed destroyed
+            if target_status == "succeeded" and result:
                 for art in result.artifacts:
-                    artifact_rec = Artifact(
-                        task_id=task_id,
-                        execution_id=execution_id,
-                        filename=art.filename,
-                        storage_key=art.storage_path,
-                        mime_type=art.mime_type,
-                        size_bytes=art.size_bytes,
-                        sha256=art.sha256,
-                        created_at=art.created_at,
+                    session.add(
+                        Artifact(
+                            task_id=task_id,
+                            execution_id=execution_id,
+                            filename=art.filename,
+                            storage_key=art.storage_path,
+                            mime_type=art.mime_type,
+                            size_bytes=art.size_bytes,
+                            sha256=art.sha256,
+                            created_at=art.created_at,
+                        )
                     )
-                    session.add(artifact_rec)
 
             await session.commit()
-            logger.info("Execution %s finalized with terminal status '%s'", execution_id, exec_rec.status)
+            logger.info("Execution %s finalized with terminal status '%s'", execution_id, target_status)
 
 
 def main():

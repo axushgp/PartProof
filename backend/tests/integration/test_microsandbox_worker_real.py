@@ -131,10 +131,12 @@ print(f"Step 2 processed {len(items)} items. Total cost: {total_cost}")
     assert "TOTAL" in content
     assert "520.0" in content  # 10*5.50 + 20*12.00 + 5*45.00 = 55 + 240 + 225 = 520.0
 
-    # Verify no running microVMs left behind via CLI
+    # Verify no running microVMs left behind via CLI: fail if msb ls fails or reports leak
     msb_list = subprocess.run(["msb", "ls"], capture_output=True, text=True)
-    if msb_list.returncode == 0:
-        assert result.sandbox_id not in msb_list.stdout
+    assert msb_list.returncode == 0, f"msb ls verification failed with exit code {msb_list.returncode}: {msb_list.stderr}"
+    assert result.sandbox_id not in msb_list.stdout, (
+        f"MicroVM '{result.sandbox_id}' still detected running in msb ls: {msb_list.stdout}"
+    )
 
 
 @pytest.mark.asyncio
@@ -300,10 +302,12 @@ print(f"CALCULATED_TOTAL:{total}")
             assert arts[0].filename == "audit_receipt.csv"
             assert os.path.exists(arts[0].storage_key)
 
-            # Verification of microVM absence via msb ls
+            # Verification of microVM absence via msb ls: must fail if msb ls fails or reports leak
             msb_list = subprocess.run(["msb", "ls"], capture_output=True, text=True)
-            if msb_list.returncode == 0:
-                assert db_exec.sandbox_id not in msb_list.stdout
+            assert msb_list.returncode == 0, f"msb ls verification failed with exit code {msb_list.returncode}: {msb_list.stderr}"
+            assert db_exec.sandbox_id not in msb_list.stdout, (
+                f"MicroVM '{db_exec.sandbox_id}' still detected running after worker finalization: {msb_list.stdout}"
+            )
 
 
 @pytest.mark.asyncio
@@ -311,9 +315,10 @@ async def test_real_microsandbox_stale_recovery_with_postgres(tmp_path):
     """
     Tests stale execution recovery with PostgreSQL:
     - Verifies an execution whose lease expired with verified cleanup is safely requeued.
-    - Verifies an execution whose microVM cannot be proven destroyed transitions to needs_reconciliation.
+    - Genuinely simulates unverified cleanup for an execution and verifies transition to needs_reconciliation.
     """
     from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
     from app.models.entities import Execution, Task, User
     from app.workers.recovery import StaleExecutionReconciler
     from tests.integration.test_postgres_concurrency import (
@@ -350,7 +355,7 @@ async def test_real_microsandbox_stale_recovery_with_postgres(tmp_path):
             )
             session.add(exec1)
 
-            # Case 2: Stale execution where microVM cannot be confirmed destroyed
+            # Case 2: Stale execution where microVM cleanup cannot be confirmed
             task2 = Task(user_id=user.id, title="Stale Task 2", description="Leak test", status="running")
             session.add(task2)
             await session.flush()
@@ -368,17 +373,35 @@ async def test_real_microsandbox_stale_recovery_with_postgres(tmp_path):
             e1_id, e2_id = exec1.id, exec2.id
             t1_id, t2_id = task1.id, task2.id
 
-        # Reconcile Case 1 (sandbox absent -> requeue)
-        # Note: 'already-absent-sandbox-id-9999' will not be found in 'msb ls', proving absence!
-        reconciled = await reconciler.reconcile_stale_executions(max_attempts=3)
-        assert reconciled >= 1
+        # Reconcile with genuine failure simulation for unverified microVM
+        original_verify = reconciler._verify_and_cleanup_sandbox
+
+        async def _mock_verify(sandbox_id):
+            if sandbox_id == "unverified-leak-sandbox-id-8888":
+                return False, "Simulated msb ls leak: microVM remains active or CLI unresponsive"
+            return await original_verify(sandbox_id)
+
+        with patch.object(reconciler, "_verify_and_cleanup_sandbox", side_effect=_mock_verify):
+            reconciled = await reconciler.reconcile_stale_executions(max_attempts=3)
+            assert reconciled == 2
 
         async with SessionFactory() as session:
             res_e1 = await session.get(Execution, e1_id)
             res_t1 = await session.get(Task, t1_id)
+            res_e2 = await session.get(Execution, e2_id)
+            res_t2 = await session.get(Task, t2_id)
+
             assert res_e1 is not None and res_t1 is not None
-            # Confirmed absent -> requeued safely
+            assert res_e2 is not None and res_t2 is not None
+
+            # Case 1: Confirmed absent -> requeued safely
             assert res_e1.status == "queued"
             assert res_t1.status == "queued"
             assert res_e1.cleanup_status == "verified_destroyed"
             assert res_e1.worker_id is None
+
+            # Case 2: Unverified cleanup -> transitioned to needs_reconciliation (NEVER requeued)
+            assert res_e2.status == "needs_reconciliation"
+            assert res_t2.status == "needs_reconciliation"
+            assert res_e2.cleanup_status == "leak_detected"
+            assert res_e2.worker_id is None

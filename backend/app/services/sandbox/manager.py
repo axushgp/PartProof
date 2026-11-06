@@ -450,19 +450,30 @@ class SandboxManager:
                                 error_msg = f"Step persistence callback failed: {cb_err}"
                                 raise
 
-                    # Collect artifacts if plan succeeded and overall deadline has not expired
+                    # Collect artifacts if plan succeeded, strictly bounded by the remaining overall deadline
                     if overall_status == "succeeded" and expected_artifacts:
-                        if time.monotonic() > overall_deadline:
-                            logger.warning("Overall execution deadline expired before artifact collection")
+                        remaining_art_time = overall_deadline - time.monotonic()
+                        if remaining_art_time <= 0:
+                            logger.warning("Overall execution deadline expired before artifact collection could begin")
                             overall_status = "timed_out"
                             last_exit_code = 124
-                            error_msg = "Overall execution deadline expired before artifact collection completed"
+                            error_msg = f"Overall execution deadline ({overall_timeout}s) expired before artifact collection."
                         else:
                             try:
-                                artifacts = await adapter.collect_artifacts(
-                                    expected_artifacts,
-                                    str(dest_dir),
+                                artifacts = await asyncio.wait_for(
+                                    adapter.collect_artifacts(
+                                        expected_artifacts,
+                                        str(dest_dir),
+                                    ),
+                                    timeout=remaining_art_time,
                                 )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    f"Artifact collection timed out after remaining budget of {remaining_art_time:.2f}s"
+                                )
+                                overall_status = "timed_out"
+                                last_exit_code = 124
+                                error_msg = f"Overall execution deadline ({overall_timeout}s) exceeded during artifact collection."
                             except Exception as art_err:
                                 logger.error(f"Artifact collection failed: {art_err}", exc_info=True)
                                 overall_status = "failed"
