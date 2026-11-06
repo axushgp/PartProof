@@ -519,8 +519,8 @@ class SandboxManager:
                     error_msg = str(outer_err)
 
             finally:
-                # 4. Cleanup has a dedicated bounded grace period (15s) and is NEVER abandoned silently
-                cleanup_grace_seconds = float(getattr(settings, "SANDBOX_CLEANUP_TIMEOUT_SECONDS", 15.0))
+                # 4. Cleanup has a dedicated bounded grace period (configurable, default 30s) and is NEVER abandoned silently
+                cleanup_grace_seconds = float(getattr(settings, "SANDBOX_CLEANUP_TIMEOUT_SECONDS", 30.0))
                 try:
                     cleanup_status = await asyncio.wait_for(
                         adapter.destroy(),

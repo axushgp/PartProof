@@ -407,7 +407,7 @@ async def test_microsandbox_cancellation_during_provisioning_before_context_mana
     # Mock SDK loading and Sandbox.create to simulate cancellation before context manager assignment
     mock_sandbox_cls = AsyncMock()
     mock_sandbox_cls.create.side_effect = asyncio.CancelledError("User cancelled during provisioning")
-    mock_network_cls = AsyncMock()
+    mock_network_cls = MagicMock()
     mock_network_cls.none.return_value = "none"
 
     with patch("app.services.sandbox.microsandbox_adapter._load_microsandbox_sdk", return_value=(mock_sandbox_cls, mock_network_cls)), \
@@ -455,6 +455,7 @@ async def test_subprocess_safe_timeout_termination_and_reaping():
     mock_proc_a = AsyncMock()
     mock_proc_a.terminate = MagicMock()
     mock_proc_a.kill = MagicMock()
+    mock_proc_a.returncode = None
     # First communicate times out; second communicate (after terminate) returns reaped output
     mock_proc_a.communicate.side_effect = [
         asyncio.TimeoutError("Timeout on command"),
@@ -474,6 +475,7 @@ async def test_subprocess_safe_timeout_termination_and_reaping():
     mock_proc_b = AsyncMock()
     mock_proc_b.terminate = MagicMock()
     mock_proc_b.kill = MagicMock()
+    mock_proc_b.returncode = None
     mock_proc_b.communicate.side_effect = [
         asyncio.TimeoutError("Timeout on command"),
         asyncio.TimeoutError("Timeout on terminate grace"),
@@ -488,6 +490,171 @@ async def test_subprocess_safe_timeout_termination_and_reaping():
     mock_proc_b.terminate.assert_called_once()
     mock_proc_b.kill.assert_called_once()
     assert mock_proc_b.communicate.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_subprocess_safe_cancellation_termination_and_reaping():
+    """
+    Verifies that when parent coroutine is cancelled while subprocess is running:
+    1. Parent coroutine cancellation is handled explicitly.
+    2. run_subprocess_safe terminates the spawned process (proc.terminate()).
+    3. Successfully reaps the process within terminate_grace_period.
+    4. Propagates CancelledError to the caller without calling proc.kill().
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.sandbox.subprocess_utils import run_subprocess_safe
+
+    mock_proc = MagicMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.returncode = None
+    calls = 0
+
+    async def mock_communicate():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(10.0)
+            return b"", b""
+        return b"reaped after term", b""
+
+    mock_proc.communicate = MagicMock(side_effect=mock_communicate)
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        task = asyncio.create_task(
+            run_subprocess_safe("test-cancel-cmd", ["arg"], timeout=10.0, terminate_grace_period=0.5)
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_not_called()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_subprocess_safe_cancellation_kill_escalation():
+    """
+    Verifies that when parent coroutine is cancelled and termination grace period times out:
+    1. run_subprocess_safe escalates to proc.kill().
+    2. Reaps the killed process before propagating CancelledError.
+    3. Protects cleanup against interruption.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.sandbox.subprocess_utils import run_subprocess_safe
+
+    mock_proc = MagicMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.kill = MagicMock()
+    mock_proc.returncode = None
+    calls = 0
+
+    async def mock_communicate():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(10.0)
+            return b"", b""
+        elif calls == 2:
+            raise asyncio.TimeoutError("Terminate grace expired")
+        return b"reaped after kill", b""
+
+    mock_proc.communicate = MagicMock(side_effect=mock_communicate)
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        task = asyncio.create_task(
+            run_subprocess_safe(
+                "test-kill-cmd", ["arg"], timeout=10.0, terminate_grace_period=0.1, kill_grace_period=0.5
+            )
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_called_once()
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_subprocess_safe_failure_to_confirm_reaping_reports_uncertainty():
+    """
+    Verifies that if the final wait after proc.kill() fails or times out:
+    1. Timeout path: Returns rc=None and reports cleanup as unverified / unconfirmed,
+       never claiming the process was killed/reaped.
+    2. Cancellation path: Propagates CancelledError with error message reporting
+       unverified cleanup and unconfirmed reaping.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.sandbox.subprocess_utils import run_subprocess_safe
+
+    # 1. Timeout scenario: Command times out, terminate times out, kill wait times out
+    mock_proc_timeout = AsyncMock()
+    mock_proc_timeout.terminate = MagicMock()
+    mock_proc_timeout.kill = MagicMock()
+    mock_proc_timeout.returncode = None
+    mock_proc_timeout.communicate.side_effect = [
+        asyncio.TimeoutError("Command execution timed out"),
+        asyncio.TimeoutError("Termination grace timed out"),
+        asyncio.TimeoutError("Kill grace timed out - unconfirmed exit"),
+    ]
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc_timeout):
+        rc, out, err, err_msg = await run_subprocess_safe(
+            "test-timeout-unverified", ["arg"], timeout=0.1, terminate_grace_period=0.1, kill_grace_period=0.1
+        )
+
+    assert rc is None
+    assert err_msg is not None
+    assert "cleanup unverified" in err_msg.lower() or "unconfirmed" in err_msg.lower()
+    # Must NOT claim the process was killed!
+    assert "and was killed." not in err_msg
+    mock_proc_timeout.terminate.assert_called_once()
+    mock_proc_timeout.kill.assert_called_once()
+
+    # 2. Cancellation scenario: Parent cancelled, terminate times out, kill wait times out
+    mock_proc_cancel = MagicMock()
+    mock_proc_cancel.terminate = MagicMock()
+    mock_proc_cancel.kill = MagicMock()
+    mock_proc_cancel.returncode = None
+    calls = 0
+
+    async def mock_cancel_communicate():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(10.0)
+            return b"", b""
+        elif calls == 2:
+            raise asyncio.TimeoutError("Terminate grace expired")
+        raise asyncio.TimeoutError("Kill grace expired - unconfirmed exit")
+
+    mock_proc_cancel.communicate = MagicMock(side_effect=mock_cancel_communicate)
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc_cancel):
+        task = asyncio.create_task(
+            run_subprocess_safe(
+                "test-cancel-unverified", ["arg"], timeout=10.0, terminate_grace_period=0.1, kill_grace_period=0.1
+            )
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+    assert "cleanup unverified" in str(exc_info.value).lower() or "unconfirmed" in str(exc_info.value).lower()
+    mock_proc_cancel.terminate.assert_called_once()
+    mock_proc_cancel.kill.assert_called_once()
+    assert calls == 3
 
 
 @pytest.mark.asyncio
