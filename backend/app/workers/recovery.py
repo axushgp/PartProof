@@ -1,16 +1,5 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import List, Optional
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from app.models.entities import Execution, ExecutionEvent, Task
-
-logger = logging.getLogger("partproof.worker.recovery")
-
-
-import asyncio
-import logging
 import os
 import shutil
 import uuid
@@ -293,27 +282,36 @@ class StaleExecutionReconciler:
             else:
                 return False, f"msb CLI binary not found at '{msb_bin}' or in PATH; cannot prove destruction."
 
-        # Step 1: Attempt to stop sandbox via msb stop
+        # Step 1: Force remove sandbox and its stored resources via msb rm --force
         try:
-            stop_proc = await asyncio.create_subprocess_exec(
+            rm_proc = await asyncio.create_subprocess_exec(
                 msb_bin,
-                "stop",
+                "rm",
+                "--force",
                 sandbox_id,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stop_out, stop_err = await asyncio.wait_for(stop_proc.communicate(), timeout=15.0)
+            rm_out, rm_err = await asyncio.wait_for(rm_proc.communicate(), timeout=15.0)
             logger.info(
-                "msb stop %s exited with code %d (stdout: %s, stderr: %s)",
+                "msb rm --force %s exited with code %d (stdout: %s, stderr: %s)",
                 sandbox_id,
-                stop_proc.returncode,
-                stop_out.decode("utf-8", errors="replace").strip(),
-                stop_err.decode("utf-8", errors="replace").strip(),
+                rm_proc.returncode,
+                rm_out.decode("utf-8", errors="replace").strip(),
+                rm_err.decode("utf-8", errors="replace").strip(),
             )
-        except Exception as stop_e:
-            logger.warning("Error invoking msb stop for %s: %s", sandbox_id, stop_e)
+            if rm_proc.returncode != 0:
+                err_text = rm_err.decode("utf-8", errors="replace").strip()
+                logger.warning("msb rm --force returned non-zero code %d: %s", rm_proc.returncode, err_text)
+                return False, f"msb rm --force failed with exit code {rm_proc.returncode}: {err_text}"
+        except asyncio.TimeoutError:
+            logger.warning("msb rm --force timed out after 15.0s for %s", sandbox_id)
+            return False, f"msb rm --force timed out after 15.0s for '{sandbox_id}'"
+        except Exception as rm_e:
+            logger.warning("Error invoking msb rm --force for %s: %s", sandbox_id, rm_e)
+            return False, f"Error invoking msb rm --force for '{sandbox_id}': {rm_e}"
 
-        # Step 2: Independently verify absence via msb ls
+        # Step 2: Independently verify complete absence via msb ls
         try:
             ls_proc = await asyncio.create_subprocess_exec(
                 msb_bin,
@@ -329,9 +327,11 @@ class StaleExecutionReconciler:
 
             ls_text = ls_out.decode("utf-8", errors="replace")
             if sandbox_id in ls_text:
-                return False, f"Sandbox microVM '{sandbox_id}' still detected running in msb ls: {ls_text.strip()}"
+                return False, f"Sandbox microVM '{sandbox_id}' still detected present in msb ls: {ls_text.strip()}"
 
             return True, f"MicroVM '{sandbox_id}' confirmed absent in msb ls."
 
+        except asyncio.TimeoutError:
+            return False, f"msb ls verification timed out after 10.0s for '{sandbox_id}'"
         except Exception as ls_e:
             return False, f"Failed to execute msb ls absence verification: {ls_e}"

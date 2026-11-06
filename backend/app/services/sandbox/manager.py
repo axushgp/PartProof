@@ -312,185 +312,229 @@ class SandboxManager:
             guest_kernel = None
 
             try:
-                async with adapter:
-                    guest_kernel = getattr(adapter, "_guest_kernel", None)
-                    failed_or_stopped = False
-
-                    for idx, step in enumerate(steps):
-                        # 1. Enforce cumulative execution deadline
-                        remaining_time = overall_deadline - time.monotonic()
-                        if remaining_time <= 0 and not failed_or_stopped:
-                            logger.warning(
-                                f"Overall execution deadline of {overall_timeout}s expired before step {step.step_number}"
-                            )
-                            overall_status = "timed_out"
-                            failed_or_stopped = True
-                            last_exit_code = 124
-                            error_msg = f"Overall execution deadline ({overall_timeout}s) exceeded before step {step.step_number}"
-
-                        # 2. Check cancellation before launching step
-                        if check_cancellation is not None and not failed_or_stopped:
-                            try:
-                                is_cancelled = await check_cancellation()
-                                if is_cancelled:
-                                    logger.info(f"Cancellation detected before step {step.step_number}")
-                                    overall_status = "cancelled"
-                                    failed_or_stopped = True
-                                    error_msg = "Execution was cancelled by user request."
-                            except Exception as ce:
-                                logger.error(f"Error checking cancellation before step {step.step_number}: {ce}. Failing closed.")
-                                overall_status = "failed"
-                                failed_or_stopped = True
-                                error_msg = f"Cancellation check failed closed: {ce}"
-
-                        if failed_or_stopped:
-                            # Skip this and all remaining steps, preserving full step metadata
-                            skipped_output = StepExecutionOutput(
-                                step_number=step.step_number,
-                                stdout="",
-                                stderr="Skipped due to prior failure, timeout, or cancellation.",
-                                exit_code=-1,
-                                duration_seconds=0.0,
-                                status="skipped",
-                                started_at=datetime.now(timezone.utc),
-                                completed_at=datetime.now(timezone.utc),
-                                description=step.description,
-                                execution_type=step.execution_type,
-                                code=step.code,
-                            )
-                            step_outputs.append(skipped_output)
-                            if on_step_complete is not None:
-                                try:
-                                    await on_step_complete(step.step_number, skipped_output)
-                                except Exception as cb_err:
-                                    logger.error(f"Callback on_step_complete failed for skipped step {step.step_number}: {cb_err}")
-                                    raise
-                            continue
-
-                        # 3. Bound step timeout by remaining overall deadline
-                        step_configured_timeout = step.timeout_seconds or overall_timeout
-                        effective_step_timeout = max(0.1, min(step_configured_timeout, remaining_time))
-
-                        step_filename = step.filename or f"step_{step.step_number}.py"
-                        step_req = ExecutionRequest(
-                            code=step.code,
-                            filename=step_filename,
-                            expected_artifacts=[],
-                            timeout_seconds=effective_step_timeout,
+                # 1. Bounded VM Provisioning within remaining overall deadline
+                failed_or_stopped = False
+                prov_remaining = overall_deadline - time.monotonic()
+                if prov_remaining <= 0:
+                    logger.warning(
+                        f"Overall execution deadline of {overall_timeout}s expired before VM provisioning could start"
+                    )
+                    overall_status = "timed_out"
+                    failed_or_stopped = True
+                    last_exit_code = 124
+                    error_msg = f"Overall execution deadline ({overall_timeout}s) expired before microVM provisioning."
+                else:
+                    try:
+                        await asyncio.wait_for(adapter.create(), timeout=prov_remaining)
+                        guest_kernel = getattr(adapter, "_guest_kernel", None)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"MicroVM provisioning timed out after remaining budget of {prov_remaining:.2f}s"
                         )
+                        overall_status = "timed_out"
+                        failed_or_stopped = True
+                        last_exit_code = 124
+                        error_msg = f"Overall execution deadline ({overall_timeout}s) exceeded during microVM provisioning."
+                    except Exception as prov_err:
+                        logger.error(f"MicroVM provisioning failed: {prov_err}", exc_info=True)
+                        overall_status = "failed"
+                        failed_or_stopped = True
+                        last_exit_code = 1
+                        error_msg = f"MicroVM provisioning failed: {prov_err}"
 
-                        step_start = datetime.now(timezone.utc)
-                        step_exec_out: Optional[ExecutionOutput] = None
-                        step_status = "failed"
-                        step_stderr = ""
-                        step_stdout = ""
-                        step_exit_code = 1
-                        step_duration = 0.0
+                # 2. Sequential Step Execution
+                for idx, step in enumerate(steps):
+                    # 2a. Enforce cumulative execution deadline
+                    remaining_time = overall_deadline - time.monotonic()
+                    if remaining_time <= 0 and not failed_or_stopped:
+                        logger.warning(
+                            f"Overall execution deadline of {overall_timeout}s expired before step {step.step_number}"
+                        )
+                        overall_status = "timed_out"
+                        failed_or_stopped = True
+                        last_exit_code = 124
+                        error_msg = f"Overall execution deadline ({overall_timeout}s) exceeded before step {step.step_number}"
 
+                    # 2b. Check cancellation before launching step
+                    if check_cancellation is not None and not failed_or_stopped:
                         try:
-                            step_exec_out = await adapter.execute(step_req)
-                            step_duration = step_exec_out.duration_seconds
-                            step_stdout = step_exec_out.stdout
-                            step_stderr = step_exec_out.stderr
-                            step_exit_code = step_exec_out.exit_code
-                            if step_exec_out.guest_kernel:
-                                guest_kernel = step_exec_out.guest_kernel
-
-                            if step_exit_code == 0:
-                                step_status = "succeeded"
-                            else:
-                                step_status = "failed"
-                                overall_status = "failed"
+                            is_cancelled = await check_cancellation()
+                            if is_cancelled:
+                                logger.info(f"Cancellation detected before step {step.step_number}")
+                                overall_status = "cancelled"
                                 failed_or_stopped = True
-                                last_exit_code = step_exit_code
-                                error_msg = f"Step {step.step_number} failed with exit code {step_exit_code}"
-
-                        except SandboxTimeoutError as te:
-                            logger.warning(f"Step {step.step_number} timed out: {te}")
-                            step_status = "timed_out"
-                            overall_status = "timed_out"
-                            failed_or_stopped = True
-                            last_exit_code = 124
-                            step_duration = effective_step_timeout
-                            step_stderr = f"Step timed out: {te.message}\n"
-                            error_msg = f"Step {step.step_number} timed out: {te}"
-
-                        except Exception as step_err:
-                            logger.error(f"Step {step.step_number} encountered error: {step_err}", exc_info=True)
-                            step_status = "failed"
+                                error_msg = "Execution was cancelled by user request."
+                        except Exception as ce:
+                            logger.error(f"Error checking cancellation before step {step.step_number}: {ce}. Failing closed.")
                             overall_status = "failed"
                             failed_or_stopped = True
-                            last_exit_code = 1
-                            step_stderr = f"Step execution error: {str(step_err)}\n"
-                            error_msg = f"Step {step.step_number} error: {step_err}"
+                            error_msg = f"Cancellation check failed closed: {ce}"
 
-                        step_finish = datetime.now(timezone.utc)
-                        recorded_step = StepExecutionOutput(
+                    if failed_or_stopped:
+                        # Skip this and all remaining steps, preserving full step metadata
+                        skipped_output = StepExecutionOutput(
                             step_number=step.step_number,
-                            stdout=step_stdout,
-                            stderr=step_stderr,
-                            exit_code=step_exit_code,
-                            duration_seconds=step_duration,
-                            status=step_status,
-                            started_at=step_start,
-                            completed_at=step_finish,
+                            stdout="",
+                            stderr="Skipped due to prior failure, timeout, or cancellation.",
+                            exit_code=-1,
+                            duration_seconds=0.0,
+                            status="skipped",
+                            started_at=datetime.now(timezone.utc),
+                            completed_at=datetime.now(timezone.utc),
                             description=step.description,
                             execution_type=step.execution_type,
                             code=step.code,
                         )
-                        step_outputs.append(recorded_step)
-
+                        step_outputs.append(skipped_output)
                         if on_step_complete is not None:
                             try:
-                                await on_step_complete(step.step_number, recorded_step)
+                                await on_step_complete(step.step_number, skipped_output)
                             except Exception as cb_err:
-                                logger.error(f"Callback on_step_complete failed for step {step.step_number}: {cb_err}")
-                                failed_or_stopped = True
-                                overall_status = "failed"
-                                error_msg = f"Step persistence callback failed: {cb_err}"
+                                logger.error(f"Callback on_step_complete failed for skipped step {step.step_number}: {cb_err}")
                                 raise
+                        continue
 
-                    # Collect artifacts if plan succeeded, strictly bounded by the remaining overall deadline
-                    if overall_status == "succeeded" and expected_artifacts:
-                        remaining_art_time = overall_deadline - time.monotonic()
-                        if remaining_art_time <= 0:
-                            logger.warning("Overall execution deadline expired before artifact collection could begin")
+                    # 2c. Bound step timeout by remaining overall deadline
+                    step_configured_timeout = step.timeout_seconds or overall_timeout
+                    effective_step_timeout = max(0.1, min(step_configured_timeout, remaining_time))
+
+                    step_filename = step.filename or f"step_{step.step_number}.py"
+                    step_req = ExecutionRequest(
+                        code=step.code,
+                        filename=step_filename,
+                        expected_artifacts=[],
+                        timeout_seconds=effective_step_timeout,
+                    )
+
+                    step_start = datetime.now(timezone.utc)
+                    step_exec_out: Optional[ExecutionOutput] = None
+                    step_status = "failed"
+                    step_stderr = ""
+                    step_stdout = ""
+                    step_exit_code = 1
+                    step_duration = 0.0
+
+                    try:
+                        step_exec_out = await adapter.execute(step_req)
+                        step_duration = step_exec_out.duration_seconds
+                        step_stdout = step_exec_out.stdout
+                        step_stderr = step_exec_out.stderr
+                        step_exit_code = step_exec_out.exit_code
+                        if step_exec_out.guest_kernel:
+                            guest_kernel = step_exec_out.guest_kernel
+
+                        if step_exit_code == 0:
+                            step_status = "succeeded"
+                        else:
+                            step_status = "failed"
+                            overall_status = "failed"
+                            failed_or_stopped = True
+                            last_exit_code = step_exit_code
+                            error_msg = f"Step {step.step_number} failed with exit code {step_exit_code}"
+
+                    except SandboxTimeoutError as te:
+                        logger.warning(f"Step {step.step_number} timed out: {te}")
+                        step_status = "timed_out"
+                        overall_status = "timed_out"
+                        failed_or_stopped = True
+                        last_exit_code = 124
+                        step_duration = effective_step_timeout
+                        step_stderr = f"Step timed out: {te.message}\n"
+                        error_msg = f"Step {step.step_number} timed out: {te}"
+
+                    except Exception as step_err:
+                        logger.error(f"Step {step.step_number} encountered error: {step_err}", exc_info=True)
+                        step_status = "failed"
+                        overall_status = "failed"
+                        failed_or_stopped = True
+                        last_exit_code = 1
+                        step_stderr = f"Step execution error: {str(step_err)}\n"
+                        error_msg = f"Step {step.step_number} error: {step_err}"
+
+                    step_finish = datetime.now(timezone.utc)
+                    recorded_step = StepExecutionOutput(
+                        step_number=step.step_number,
+                        stdout=step_stdout,
+                        stderr=step_stderr,
+                        exit_code=step_exit_code,
+                        duration_seconds=step_duration,
+                        status=step_status,
+                        started_at=step_start,
+                        completed_at=step_finish,
+                        description=step.description,
+                        execution_type=step.execution_type,
+                        code=step.code,
+                    )
+                    step_outputs.append(recorded_step)
+
+                    if on_step_complete is not None:
+                        try:
+                            await on_step_complete(step.step_number, recorded_step)
+                        except Exception as cb_err:
+                            logger.error(f"Callback on_step_complete failed for step {step.step_number}: {cb_err}")
+                            failed_or_stopped = True
+                            overall_status = "failed"
+                            error_msg = f"Step persistence callback failed: {cb_err}"
+                            raise
+
+                # 3. Collect artifacts if plan succeeded, strictly bounded by the remaining overall deadline
+                if overall_status == "succeeded" and expected_artifacts:
+                    remaining_art_time = overall_deadline - time.monotonic()
+                    if remaining_art_time <= 0:
+                        logger.warning("Overall execution deadline expired before artifact collection could begin")
+                        overall_status = "timed_out"
+                        last_exit_code = 124
+                        error_msg = f"Overall execution deadline ({overall_timeout}s) expired before artifact collection."
+                    else:
+                        try:
+                            artifacts = await asyncio.wait_for(
+                                adapter.collect_artifacts(
+                                    expected_artifacts,
+                                    str(dest_dir),
+                                ),
+                                timeout=remaining_art_time,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"Artifact collection timed out after remaining budget of {remaining_art_time:.2f}s"
+                            )
                             overall_status = "timed_out"
                             last_exit_code = 124
-                            error_msg = f"Overall execution deadline ({overall_timeout}s) expired before artifact collection."
-                        else:
-                            try:
-                                artifacts = await asyncio.wait_for(
-                                    adapter.collect_artifacts(
-                                        expected_artifacts,
-                                        str(dest_dir),
-                                    ),
-                                    timeout=remaining_art_time,
-                                )
-                            except asyncio.TimeoutError:
-                                logger.warning(
-                                    f"Artifact collection timed out after remaining budget of {remaining_art_time:.2f}s"
-                                )
-                                overall_status = "timed_out"
-                                last_exit_code = 124
-                                error_msg = f"Overall execution deadline ({overall_timeout}s) exceeded during artifact collection."
-                            except Exception as art_err:
-                                logger.error(f"Artifact collection failed: {art_err}", exc_info=True)
-                                overall_status = "failed"
-                                last_exit_code = 1
-                                error_msg = f"Artifact collection failed: {art_err}"
-
-                cleanup_status = "verified_destroyed"
+                            error_msg = f"Overall execution deadline ({overall_timeout}s) exceeded during artifact collection."
+                        except Exception as art_err:
+                            logger.error(f"Artifact collection failed: {art_err}", exc_info=True)
+                            overall_status = "failed"
+                            last_exit_code = 1
+                            error_msg = f"Artifact collection failed: {art_err}"
 
             except Exception as outer_err:
-                cleanup_status = "failed"
-                logger.error(f"Multi-step sandbox lifecycle failed: {outer_err}", exc_info=True)
+                logger.error(f"Multi-step sandbox execution failed: {outer_err}", exc_info=True)
                 if overall_status == "succeeded":
                     overall_status = "failed"
                 if not error_msg:
                     error_msg = str(outer_err)
 
             finally:
+                # 4. Cleanup has a dedicated bounded grace period (15s) and is NEVER abandoned silently
+                cleanup_grace_seconds = float(getattr(settings, "SANDBOX_CLEANUP_TIMEOUT_SECONDS", 15.0))
+                try:
+                    cleanup_status = await asyncio.wait_for(
+                        adapter.destroy(),
+                        timeout=cleanup_grace_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"MicroVM destruction timed out after grace period of {cleanup_grace_seconds}s for sandbox {sandbox_id}"
+                    )
+                    cleanup_status = "failed"
+                    if not error_msg:
+                        error_msg = f"MicroVM cleanup timed out after {cleanup_grace_seconds}s grace period."
+                except Exception as clean_err:
+                    logger.error(f"MicroVM destruction failed for sandbox {sandbox_id}: {clean_err}", exc_info=True)
+                    cleanup_status = "failed"
+                    if not error_msg:
+                        error_msg = f"MicroVM cleanup failed: {clean_err}"
+
                 self._active_sandboxes.pop(sandbox_id, None)
 
             total_duration = round(time.monotonic() - start_wall_time, 4)

@@ -814,13 +814,14 @@ async def test_atomic_worker_ownership_and_lost_lease_prevents_mutations(db_sess
 
 
 @pytest.mark.asyncio
-async def test_recovery_injected_subprocess_outcomes_for_msb_stop_and_ls(db_session: AsyncSession):
+async def test_recovery_injected_subprocess_outcomes_for_msb_rm_and_ls(db_session: AsyncSession):
     """
-    Injects subprocess outcomes for msb stop and msb ls:
-    - Non-zero exit code on msb ls
-    - Command timeout on msb ls
-    - Sandbox ID still present in msb ls output
-    Ensures that every uncertain cleanup result becomes 'needs_reconciliation', never requeued.
+    Injects subprocess outcomes for MicroSandbox v0.7.13 recovery via msb rm --force and msb ls:
+    1. Successful removal: msb rm --force exits 0, msb ls shows sandbox absent -> requeued / verified_destroyed
+    2. Failed removal: msb rm --force exits with non-zero exit code -> needs_reconciliation
+    3. Command timeout: msb rm --force times out -> needs_reconciliation
+    4. Persistent sandbox record: msb rm --force exits 0, but msb ls still contains sandbox ID -> needs_reconciliation
+    5. Absence verification timeout: msb ls times out -> needs_reconciliation
     """
     from unittest.mock import patch, AsyncMock
     from app.workers.recovery import StaleExecutionReconciler
@@ -833,63 +834,63 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_stop_and_ls(db_sess
     reconciler = StaleExecutionReconciler(session_factory)
     expired = datetime.now(timezone.utc) - timedelta(seconds=60)
 
-    # Outcome 1: msb ls exits with non-zero code (e.g. 1)
-    task1 = Task(user_id=user.id, title="Subproc Error Task", description="msb ls error", status="running")
+    # 1. Successful removal: msb rm --force exits 0 and msb ls confirms absence
+    task1 = Task(user_id=user.id, title="Subproc Success Task", description="clean teardown", status="running")
     db_session.add(task1)
     await db_session.flush()
     exec1 = Execution(
         task_id=task1.id,
         status="running",
         worker_id="old-w1",
-        sandbox_id="sb-subproc-err-1",
+        sandbox_id="sb-clean-1",
         lease_expires_at=expired,
         attempt_count=1,
     )
     db_session.add(exec1)
     await db_session.commit()
 
-    mock_stop_proc = AsyncMock()
-    mock_stop_proc.communicate.return_value = (b"", b"")
-    mock_stop_proc.returncode = 0
+    mock_rm_success = AsyncMock()
+    mock_rm_success.communicate.return_value = (b"", b"")
+    mock_rm_success.returncode = 0
 
-    mock_ls_err = AsyncMock()
-    mock_ls_err.communicate.return_value = (b"", b"daemon failure")
-    mock_ls_err.returncode = 1
+    mock_ls_absent = AsyncMock()
+    mock_ls_absent.communicate.return_value = (b"sb-other-42 running\n", b"")
+    mock_ls_absent.returncode = 0
 
     with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
          patch("os.path.exists", return_value=True), \
-         patch("asyncio.create_subprocess_exec", side_effect=[mock_stop_proc, mock_ls_err]):
+         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_success, mock_ls_absent]):
         count1 = await reconciler.reconcile_stale_executions(max_attempts=3)
         assert count1 == 1
 
     await db_session.refresh(exec1)
     await db_session.refresh(task1)
-    assert exec1.status == "needs_reconciliation"
-    assert exec1.cleanup_status == "leak_detected"
-    assert task1.status == "needs_reconciliation"
+    assert exec1.status == "queued"
+    assert exec1.cleanup_status == "verified_destroyed"
+    assert task1.status == "queued"
 
-    # Outcome 2: msb ls output still contains sandbox ID (microVM leak)
-    task2 = Task(user_id=user.id, title="Subproc Leak Task", description="sandbox still running", status="running")
+    # 2. Failed removal: msb rm --force exits with non-zero code (e.g. 1)
+    task2 = Task(user_id=user.id, title="Subproc Error Task", description="msb rm error", status="running")
     db_session.add(task2)
     await db_session.flush()
     exec2 = Execution(
         task_id=task2.id,
         status="running",
         worker_id="old-w2",
-        sandbox_id="sb-subproc-leak-2",
+        sandbox_id="sb-subproc-err-2",
         lease_expires_at=expired,
         attempt_count=1,
     )
     db_session.add(exec2)
     await db_session.commit()
 
-    mock_ls_running = AsyncMock()
-    mock_ls_running.communicate.return_value = (b"sb-subproc-leak-2 running\nsb-other running\n", b"")
-    mock_ls_running.returncode = 0
+    mock_rm_err = AsyncMock()
+    mock_rm_err.communicate.return_value = (b"", b"daemon failure during rm")
+    mock_rm_err.returncode = 1
 
     with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
          patch("os.path.exists", return_value=True), \
-         patch("asyncio.create_subprocess_exec", side_effect=[mock_stop_proc, mock_ls_running]):
+         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_err]):
         count2 = await reconciler.reconcile_stale_executions(max_attempts=3)
         assert count2 == 1
 
@@ -899,8 +900,8 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_stop_and_ls(db_sess
     assert exec2.cleanup_status == "leak_detected"
     assert task2.status == "needs_reconciliation"
 
-    # Outcome 3: msb ls times out
-    task3 = Task(user_id=user.id, title="Subproc Timeout Task", description="timeout on ls", status="running")
+    # 3. Timeout: msb rm --force times out
+    task3 = Task(user_id=user.id, title="Subproc Timeout Rm Task", description="timeout on rm", status="running")
     db_session.add(task3)
     await db_session.flush()
     exec3 = Execution(
@@ -914,12 +915,12 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_stop_and_ls(db_sess
     db_session.add(exec3)
     await db_session.commit()
 
-    mock_ls_timeout = AsyncMock()
-    mock_ls_timeout.communicate.side_effect = asyncio.TimeoutError()
+    mock_rm_timeout = AsyncMock()
+    mock_rm_timeout.communicate.side_effect = asyncio.TimeoutError()
 
     with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
          patch("os.path.exists", return_value=True), \
-         patch("asyncio.create_subprocess_exec", side_effect=[mock_stop_proc, mock_ls_timeout]):
+         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_timeout]):
         count3 = await reconciler.reconcile_stale_executions(max_attempts=3)
         assert count3 == 1
 
@@ -928,3 +929,156 @@ async def test_recovery_injected_subprocess_outcomes_for_msb_stop_and_ls(db_sess
     assert exec3.status == "needs_reconciliation"
     assert exec3.cleanup_status == "leak_detected"
     assert task3.status == "needs_reconciliation"
+
+    # 4. Persistent sandbox record: msb rm --force exits 0, but msb ls still contains sandbox ID
+    task4 = Task(user_id=user.id, title="Subproc Leak Task", description="sandbox still present", status="running")
+    db_session.add(task4)
+    await db_session.flush()
+    exec4 = Execution(
+        task_id=task4.id,
+        status="running",
+        worker_id="old-w4",
+        sandbox_id="sb-subproc-leak-4",
+        lease_expires_at=expired,
+        attempt_count=1,
+    )
+    db_session.add(exec4)
+    await db_session.commit()
+
+    mock_rm_proc = AsyncMock()
+    mock_rm_proc.communicate.return_value = (b"", b"")
+    mock_rm_proc.returncode = 0
+
+    mock_ls_running = AsyncMock()
+    mock_ls_running.communicate.return_value = (b"sb-subproc-leak-4 running\nsb-other running\n", b"")
+    mock_ls_running.returncode = 0
+
+    with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
+         patch("os.path.exists", return_value=True), \
+         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_proc, mock_ls_running]):
+        count4 = await reconciler.reconcile_stale_executions(max_attempts=3)
+        assert count4 == 1
+
+    await db_session.refresh(exec4)
+    await db_session.refresh(task4)
+    assert exec4.status == "needs_reconciliation"
+    assert exec4.cleanup_status == "leak_detected"
+    assert task4.status == "needs_reconciliation"
+
+    # 5. Absence verification timeout: msb ls times out
+    task5 = Task(user_id=user.id, title="Subproc Timeout Ls Task", description="timeout on ls", status="running")
+    db_session.add(task5)
+    await db_session.flush()
+    exec5 = Execution(
+        task_id=task5.id,
+        status="running",
+        worker_id="old-w5",
+        sandbox_id="sb-subproc-timeout-5",
+        lease_expires_at=expired,
+        attempt_count=1,
+    )
+    db_session.add(exec5)
+    await db_session.commit()
+
+    mock_ls_timeout = AsyncMock()
+    mock_ls_timeout.communicate.side_effect = asyncio.TimeoutError()
+
+    with patch("app.core.config.settings.SANDBOX_BACKEND", "microsandbox"), \
+         patch("os.path.exists", return_value=True), \
+         patch("asyncio.create_subprocess_exec", side_effect=[mock_rm_proc, mock_ls_timeout]):
+        count5 = await reconciler.reconcile_stale_executions(max_attempts=3)
+        assert count5 == 1
+
+    await db_session.refresh(exec5)
+    await db_session.refresh(task5)
+    assert exec5.status == "needs_reconciliation"
+    assert exec5.cleanup_status == "leak_detected"
+    assert task5.status == "needs_reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_worker_lease_expiry_during_validation_aborts_execution(db_session: AsyncSession):
+    """
+    Regression test:
+    Worker captures current timestamp immediately before the preparing -> running update.
+    If the worker's lease expires during validation, the atomic CAS update matches 0 rows.
+    Worker must cleanly abort without starting the microVM or executing any steps.
+    """
+    from unittest.mock import AsyncMock
+    from app.workers.execution_worker import ExecutionWorker
+    from app.workers.queue import ClaimedExecution
+
+    session_factory = MockSessionFactory(db_session)
+    user = User(email="lease-validation@partproof.io", password_hash="dummy")
+    db_session.add(user)
+    await db_session.flush()
+
+    plan_dict = copy.deepcopy(VALID_PLAN_DICT)
+    plan_hash = compute_plan_hash(plan_dict)
+
+    task = Task(user_id=user.id, title="Validation Lease Expiry Task", description="Testing staleness guard", status="preparing")
+    db_session.add(task)
+    await db_session.flush()
+
+    approval = Approval(
+        task_id=task.id,
+        approved_by=user.email,
+        approved_plan_hash=plan_hash,
+        decision="approved",
+    )
+    db_session.add(approval)
+    await db_session.flush()
+
+    # Set lease_expires_at to the past so it is already expired when validation finishes
+    expired_lease = datetime.now(timezone.utc) - timedelta(seconds=5)
+    execution = Execution(
+        task_id=task.id,
+        approval_id=approval.id,
+        plan_hash=plan_hash,
+        plan_snapshot=plan_dict,
+        status="preparing",
+        worker_id="worker-val-expired",
+        lease_expires_at=expired_lease,
+        runtime_image="python:3.12-slim",
+        cpu_limit=1,
+        memory_limit_mb=512,
+        network_mode="none",
+        timeout_seconds=30,
+    )
+    db_session.add(execution)
+    await db_session.commit()
+
+    worker = ExecutionWorker(session_factory=session_factory, worker_id="worker-val-expired")
+    worker.sandbox_manager.execute_plan = AsyncMock()
+
+    claimed = ClaimedExecution(
+        execution_id=execution.id,
+        task_id=task.id,
+        worker_id="worker-val-expired",
+        plan_snapshot=plan_dict,
+        plan_hash=plan_hash,
+        attempt_count=1,
+        runtime_image="python:3.12-slim",
+        cpu_limit=1,
+        memory_limit_mb=512,
+        network_mode="none",
+        timeout_seconds=30,
+    )
+
+    await worker._process_execution(claimed)
+
+    # MicroVM execution must NEVER be launched
+    worker.sandbox_manager.execute_plan.assert_not_called()
+
+    # Verify execution state in database was NOT promoted to running or given a sandbox_id
+    await db_session.refresh(execution)
+    assert execution.status == "preparing"
+    assert execution.sandbox_id is None
+
+    # Verify no execution_started event was written
+    events_stmt = select(ExecutionEvent).where(
+        ExecutionEvent.execution_id == execution.id,
+        ExecutionEvent.event_type == "execution_started",
+    )
+    events = (await db_session.execute(events_stmt)).scalars().all()
+    assert len(events) == 0

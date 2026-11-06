@@ -1,7 +1,7 @@
 [Unit]
 Description=PartProof Background Execution Worker (Vultr Microsandbox)
-After=network.target docker.service
-Wants=docker.service
+After=network.target docker.service partproof-postgres-ready.service
+Wants=partproof-postgres-ready.service
 
 [Service]
 Type=simple
@@ -9,10 +9,6 @@ User=linuxuser
 Group=linuxuser
 WorkingDirectory=/home/linuxuser/PartProof/backend
 EnvironmentFile=/home/linuxuser/PartProof/backend/.env
-
-# Ensure PostgreSQL container from Docker Compose is healthy before worker starts
-TimeoutStartSec=90
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do status=$(docker inspect --format "{{.State.Health.Status}}" partproof-postgres 2>/dev/null); if [ "$$status" = "healthy" ]; then exit 0; fi; echo "Waiting for partproof-postgres container health (attempt $$i/30, status=$$status)..."; sleep 2; done; echo "Timed out waiting for partproof-postgres to become healthy"; exit 1'
 
 ExecStart=/home/linuxuser/PartProof/backend/.venv/bin/python -m app.workers.execution_worker
 

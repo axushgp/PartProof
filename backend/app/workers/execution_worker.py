@@ -205,21 +205,22 @@ class ExecutionWorker:
                     await session.commit()
                 return
 
-            # Atomic conditional update transitioning preparing -> running
+            # Capture current timestamp immediately before the preparing-to-running transition
+            transition_now = datetime.now(timezone.utc)
             update_stmt = (
                 update(Execution)
                 .where(
                     Execution.id == execution_id,
                     Execution.worker_id == self.worker_id,
                     Execution.status == "preparing",
-                    Execution.lease_expires_at > now,
+                    Execution.lease_expires_at > transition_now,
                 )
                 .values(status="running", sandbox_id=sandbox_id)
             )
             upd_res = await session.execute(update_stmt)
             if upd_res.rowcount == 0:
                 logger.warning(
-                    "Worker %s lost ownership or lease expired before starting execution %s",
+                    "Worker %s lost ownership or lease expired during validation before starting execution %s",
                     self.worker_id,
                     execution_id,
                 )
@@ -466,7 +467,7 @@ class ExecutionWorker:
                 event_type = "execution_needs_reconciliation"
                 event_msg = (
                     f"Execution terminated with unverified microVM cleanup ({cleanup_status}). "
-                    f"Preserved sandbox identity for background reconciliation."
+                    f"Preserved sandbox identity for manual operator reconciliation."
                 )
             elif result is None:
                 # Unexpected lifecycle exception, but cleanup was verified
