@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+import functools
 import logging
 import os
 from typing import Optional
@@ -155,8 +156,23 @@ async def cleanup_postgres_test_data(session_factory: async_sessionmaker[AsyncSe
         await session.commit()
 
 
+class _PostgresTestContextCallable:
+    """Wrapper that exposes the generator function's __globals__ for direct test monkeypatching."""
+    def __init__(self, cm, orig_fn):
+        self._cm = cm
+        functools.update_wrapper(self, cm)
+        self.__wrapped__ = orig_fn
+
+    @property
+    def __globals__(self):
+        return self.__wrapped__.__globals__
+
+    def __call__(self, *args, **kwargs):
+        return self._cm(*args, **kwargs)
+
+
 @asynccontextmanager
-async def postgres_test_context():
+async def _postgres_test_context_inner():
     """
     Sets up an isolated PostgreSQL test environment:
     1. Validates test database URL safety.
@@ -261,6 +277,12 @@ async def postgres_test_context():
             if test_exc is not None:
                 raise cleanup_exc from test_exc
             raise cleanup_exc
+
+
+postgres_test_context = _PostgresTestContextCallable(
+    _postgres_test_context_inner,
+    _postgres_test_context_inner.__wrapped__,
+)
 
 
 MOCK_SEED_PLAN = TaskPlanSchema(
@@ -708,11 +730,16 @@ async def test_postgres_pre_cleanup_failure_restores_state(monkeypatch):
     Verifies that a pre-test cleanup failure restores dependency overrides,
     ALEMBIC_DATABASE_URL, disposes the engine, and propagates the error visibly.
     """
+    cleanup_called = False
+
     async def fail_pre_cleanup(sf):
+        nonlocal cleanup_called
+        cleanup_called = True
         raise RuntimeError("Forced pre-cleanup failure for verification")
 
-    monkeypatch.setattr(
-        "tests.integration.test_postgres_concurrency.cleanup_postgres_test_data",
+    monkeypatch.setitem(
+        postgres_test_context.__globals__,
+        "cleanup_postgres_test_data",
         fail_pre_cleanup,
     )
 
@@ -722,6 +749,7 @@ async def test_postgres_pre_cleanup_failure_restores_state(monkeypatch):
         async with postgres_test_context():
             pytest.fail("Test block should not execute on pre-cleanup failure")
 
+    assert cleanup_called is True
     assert app.dependency_overrides.get(get_db) == prev_override
 
 
@@ -739,8 +767,9 @@ async def test_postgres_post_cleanup_failure_reported(monkeypatch):
         if call_count > 1:
             raise RuntimeError("Forced post-cleanup failure for verification")
 
-    monkeypatch.setattr(
-        "tests.integration.test_postgres_concurrency.cleanup_postgres_test_data",
+    monkeypatch.setitem(
+        postgres_test_context.__globals__,
+        "cleanup_postgres_test_data",
         fail_post_cleanup,
     )
 
@@ -752,6 +781,7 @@ async def test_postgres_post_cleanup_failure_reported(monkeypatch):
             executed = True
 
     assert executed is True
+    assert call_count == 2
     assert app.dependency_overrides.get(get_db) == prev_override
 
 
