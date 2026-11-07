@@ -418,18 +418,23 @@ async def test_postgres_worker_queue_concurrency():
     3. Confirms exactly one worker claims each execution (zero double-claims).
     4. Validates lease ownership and atomic CAS renewal.
     """
-    async with postgres_test_context() as (PgTestingSessionLocal, transport):
-        # 1. Seed user
+    async with postgres_test_context() as PgTestingSessionLocal:
+        # 1. Seed user (idempotent lookup first)
         async with PgTestingSessionLocal() as session:
-            user = User(
-                email="worker_queue_concurrency@partproof.io",
-                password_hash=get_password_hash("WorkerQueueSecurePass2026!"),
-                role="auditor",
-                is_active=True,
+            res = await session.execute(
+                select(User).where(User.email == "worker_queue_concurrency@partproof.io")
             )
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
+            user = res.scalar_one_or_none()
+            if not user:
+                user = User(
+                    email="worker_queue_concurrency@partproof.io",
+                    password_hash=get_password_hash("WorkerQueueSecurePass2026!"),
+                    role="auditor",
+                    is_active=True,
+                )
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
             user_id = user.id
 
         plan_schema = TaskPlanSchema(
