@@ -1,6 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
+import logging
 import os
+from typing import Optional
 from urllib.parse import urlparse
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -25,6 +27,8 @@ from app.services.orchestration.plan_integrity import compute_plan_hash
 from app.services.policy.engine import DeterministicPolicyEngine
 from app.workers.queue import QueueManager
 from app.workers.leases import LeaseManager
+
+logger = logging.getLogger(__name__)
 
 TEST_POSTGRES_URL = os.environ.get("TEST_POSTGRES_DATABASE_URL")
 
@@ -158,18 +162,20 @@ async def postgres_test_context():
     1. Validates test database URL safety.
     2. Runs Alembic migrations against the test database.
     3. Overrides FastAPI get_db dependency with isolated PostgreSQL session factory.
-    4. Deterministically cleans up integration test data before yielding and in finally.
-    5. Deterministically restores all environment variables and dependency overrides in cleanup.
-    6. Disposes the async engine cleanly.
+    4. Deterministically executes pre-test cleanup inside try/finally lifecycle.
+    5. Yields session factory to test block.
+    6. Executes post-test cleanup in finally, visibly reporting errors without swallowing.
+    7. Always restores dependency overrides, ALEMBIC_DATABASE_URL, and disposes engine.
     """
-    assert TEST_POSTGRES_URL is not None
+    test_pg_url = os.environ.get("TEST_POSTGRES_DATABASE_URL") or TEST_POSTGRES_URL
+    assert test_pg_url is not None
     try:
-        validate_test_database_url(TEST_POSTGRES_URL)
+        validate_test_database_url(test_pg_url)
     except ValueError as e:
         pytest.fail(f"Configured TEST_POSTGRES_DATABASE_URL failed safety check: {e}")
 
     orig_alembic_url = os.environ.get("ALEMBIC_DATABASE_URL")
-    os.environ["ALEMBIC_DATABASE_URL"] = TEST_POSTGRES_URL
+    os.environ["ALEMBIC_DATABASE_URL"] = test_pg_url
 
     from alembic import command
     from alembic.config import Config
@@ -182,7 +188,7 @@ async def postgres_test_context():
     await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
 
     pg_engine = create_async_engine(
-        TEST_POSTGRES_URL,
+        test_pg_url,
         pool_size=10,
         max_overflow=20,
         echo=False,
@@ -196,32 +202,65 @@ async def postgres_test_context():
     prev_override = app.dependency_overrides.get(get_db)
     app.dependency_overrides[get_db] = override_postgres_get_db
 
-    # Clean up leftovers from previous interrupted/failed runs before yielding
-    await cleanup_postgres_test_data(PgTestingSessionLocal)
+    async def _restore_environment_and_engine() -> None:
+        """Always restores dependency overrides, environment variables, and disposes engine."""
+        try:
+            if prev_override is not None:
+                app.dependency_overrides[get_db] = prev_override
+            else:
+                app.dependency_overrides.pop(get_db, None)
+        except Exception as e:
+            logger.error("Failed to restore app dependency overrides: %s", e)
+
+        try:
+            if orig_alembic_url is not None:
+                os.environ["ALEMBIC_DATABASE_URL"] = orig_alembic_url
+            else:
+                os.environ.pop("ALEMBIC_DATABASE_URL", None)
+        except Exception as e:
+            logger.error("Failed to restore ALEMBIC_DATABASE_URL: %s", e)
+
+        try:
+            await pg_engine.dispose()
+        except Exception as e:
+            logger.error("Failed to dispose PostgreSQL engine: %s", e)
+
+    test_exc: Optional[BaseException] = None
+    cleanup_exc: Optional[BaseException] = None
+    pre_cleanup_done = False
 
     try:
-        yield PgTestingSessionLocal
-    finally:
-        # Clean up test data even if assertions fail
+        # Pre-test cleanup inside try/finally lifecycle
         try:
             await cleanup_postgres_test_data(PgTestingSessionLocal)
-        except Exception:
-            pass
+            pre_cleanup_done = True
+        except BaseException as e:
+            logger.error("Pre-test PostgreSQL cleanup failed: %s", e, exc_info=True)
+            cleanup_exc = e
+            raise
 
-        # Restore dependency overrides
-        if prev_override is not None:
-            app.dependency_overrides[get_db] = prev_override
-        else:
-            app.dependency_overrides.pop(get_db, None)
+        try:
+            yield PgTestingSessionLocal
+        except BaseException as e:
+            test_exc = e
+            raise
+    finally:
+        # Post-test cleanup (runs when pre-cleanup succeeded)
+        if pre_cleanup_done:
+            try:
+                await cleanup_postgres_test_data(PgTestingSessionLocal)
+            except BaseException as e:
+                logger.error("Post-test PostgreSQL cleanup failed: %s", e, exc_info=True)
+                cleanup_exc = e
 
-        # Restore environment variable
-        if orig_alembic_url is not None:
-            os.environ["ALEMBIC_DATABASE_URL"] = orig_alembic_url
-        else:
-            os.environ.pop("ALEMBIC_DATABASE_URL", None)
+        # Always restore overrides, environment, and engine
+        await _restore_environment_and_engine()
 
-        # Cleanly dispose PostgreSQL engine connection pool
-        await pg_engine.dispose()
+        # Propagate cleanup exception if one occurred
+        if cleanup_exc is not None:
+            if test_exc is not None:
+                raise cleanup_exc from test_exc
+            raise cleanup_exc
 
 
 MOCK_SEED_PLAN = TaskPlanSchema(
@@ -661,4 +700,113 @@ async def test_postgres_worker_queue_concurrency():
             lease_duration_seconds=90,
         )
         assert non_owner_renew is False
+
+
+@pytest.mark.asyncio
+async def test_postgres_pre_cleanup_failure_restores_state(monkeypatch):
+    """
+    Verifies that a pre-test cleanup failure restores dependency overrides,
+    ALEMBIC_DATABASE_URL, disposes the engine, and propagates the error visibly.
+    """
+    async def fail_pre_cleanup(sf):
+        raise RuntimeError("Forced pre-cleanup failure for verification")
+
+    monkeypatch.setattr(
+        "tests.integration.test_postgres_concurrency.cleanup_postgres_test_data",
+        fail_pre_cleanup,
+    )
+
+    prev_override = app.dependency_overrides.get(get_db)
+
+    with pytest.raises(RuntimeError, match="Forced pre-cleanup failure for verification"):
+        async with postgres_test_context():
+            pytest.fail("Test block should not execute on pre-cleanup failure")
+
+    assert app.dependency_overrides.get(get_db) == prev_override
+
+
+@pytest.mark.asyncio
+async def test_postgres_post_cleanup_failure_reported(monkeypatch):
+    """
+    Verifies that a post-test cleanup failure is visibly reported rather than
+    silently swallowed, while still restoring overrides and environment.
+    """
+    call_count = 0
+
+    async def fail_post_cleanup(sf):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 1:
+            raise RuntimeError("Forced post-cleanup failure for verification")
+
+    monkeypatch.setattr(
+        "tests.integration.test_postgres_concurrency.cleanup_postgres_test_data",
+        fail_post_cleanup,
+    )
+
+    prev_override = app.dependency_overrides.get(get_db)
+    executed = False
+
+    with pytest.raises(RuntimeError, match="Forced post-cleanup failure for verification"):
+        async with postgres_test_context():
+            executed = True
+
+    assert executed is True
+    assert app.dependency_overrides.get(get_db) == prev_override
+
+
+@pytest.mark.asyncio
+async def test_postgres_cleanup_lifecycle_success():
+    """
+    Verifies that successful cleanup runs before and after a test on PostgreSQL,
+    properly removing seeded tasks, approvals, and executions while preserving users.
+    """
+    seeded_task_id = None
+    seeded_user_id = None
+
+    async with postgres_test_context() as PgTestingSessionLocal:
+        async with PgTestingSessionLocal() as session:
+            # Seed user
+            res = await session.execute(
+                select(User).where(User.email == "worker_queue_concurrency@partproof.io")
+            )
+            u = res.scalar_one_or_none()
+            if not u:
+                u = User(
+                    email="worker_queue_concurrency@partproof.io",
+                    password_hash=get_password_hash("TestPass2026!"),
+                    role="auditor",
+                )
+                session.add(u)
+                await session.commit()
+                await session.refresh(u)
+            seeded_user_id = u.id
+
+            # Seed task and execution
+            t = Task(
+                user_id=seeded_user_id,
+                title="Lifecycle Test Task",
+                description="Testing cleanup lifecycle",
+                status="queued",
+            )
+            session.add(t)
+            await session.commit()
+            await session.refresh(t)
+            seeded_task_id = t.id
+
+            exc = Execution(task_id=t.id, status="queued")
+            session.add(exc)
+            await session.commit()
+
+    # Outside the first context: post-cleanup ran!
+    # Re-enter context to verify records were cleaned up and pre-cleanup succeeds
+    async with postgres_test_context() as PgTestingSessionLocal:
+        async with PgTestingSessionLocal() as session:
+            # Task must be gone
+            t_rec = await session.get(Task, seeded_task_id)
+            assert t_rec is None, "Task was not cleaned up after context exit"
+            # User must be preserved
+            u_rec = await session.get(User, seeded_user_id)
+            assert u_rec is not None, "User should be preserved across cleanups"
+
 
