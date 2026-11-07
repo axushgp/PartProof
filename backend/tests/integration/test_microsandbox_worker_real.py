@@ -212,10 +212,13 @@ print(f"CALCULATED_TOTAL:{total}")
 
     async with postgres_test_context() as SessionFactory:
         async with SessionFactory() as session:
-            # 1. Seed user and task
-            user = User(email="real-worker-test@partproof.io", password_hash="dummy")
-            session.add(user)
-            await session.flush()
+            # 1. Seed user (idempotent lookup first) and task
+            user_stmt = select(User).where(User.email == "real-worker-test@partproof.io")
+            user = (await session.execute(user_stmt)).scalar_one_or_none()
+            if not user:
+                user = User(email="real-worker-test@partproof.io", password_hash="dummy")
+                session.add(user)
+                await session.flush()
 
             task = Task(user_id=user.id, title="Live Worker Pipeline Task", description="PostgreSQL E2E", status="queued")
             session.add(task)
@@ -319,6 +322,7 @@ async def test_real_microsandbox_stale_recovery_with_postgres(tmp_path):
     """
     from datetime import datetime, timedelta, timezone
     from unittest.mock import patch
+    from sqlalchemy import select
     from app.models.entities import Execution, Task, User
     from app.workers.recovery import StaleExecutionReconciler
     from tests.integration.test_postgres_concurrency import (
@@ -336,9 +340,12 @@ async def test_real_microsandbox_stale_recovery_with_postgres(tmp_path):
         reconciler = StaleExecutionReconciler(SessionFactory)
 
         async with SessionFactory() as session:
-            user = User(email="stale-test@partproof.io", password_hash="dummy")
-            session.add(user)
-            await session.flush()
+            user_stmt = select(User).where(User.email == "stale-test@partproof.io")
+            user = (await session.execute(user_stmt)).scalar_one_or_none()
+            if not user:
+                user = User(email="stale-test@partproof.io", password_hash="dummy")
+                session.add(user)
+                await session.flush()
 
             # Case 1: Stale execution with confirmed absent sandbox (sandbox already stopped)
             task1 = Task(user_id=user.id, title="Stale Task 1", description="Requeue test", status="running")
