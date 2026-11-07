@@ -4,13 +4,22 @@ import os
 from urllib.parse import urlparse
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.security import create_access_token, get_password_hash
 from app.database.session import get_db
 from app.main import app
-from app.models.entities import Approval, Execution, ExecutionEvent, Task, TaskPlan, User
+from app.models.entities import (
+    Approval,
+    Artifact,
+    Execution,
+    ExecutionEvent,
+    ExecutionStep,
+    Task,
+    TaskPlan,
+    User,
+)
 from app.schemas.plan import PlanStepSchema, TaskPlanSchema
 from app.services.orchestration.plan_integrity import compute_plan_hash
 from app.services.policy.engine import DeterministicPolicyEngine
@@ -48,6 +57,100 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+INTEGRATION_TEST_USER_EMAILS = (
+    "auth_verify@partproof-test.io",
+    "test_auditor@partproof-test.io",
+    "worker_queue_concurrency@partproof.io",
+)
+
+
+async def cleanup_postgres_test_data(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    """
+    Cleans up all tasks, executions, approvals, plans, events, steps, and artifacts
+    associated with known integration test users in correct foreign-key order.
+    Preserves the User records themselves for idempotency across test runs.
+    """
+    async with session_factory() as session:
+        user_stmt = select(User.id).where(User.email.in_(INTEGRATION_TEST_USER_EMAILS))
+        user_ids = list((await session.execute(user_stmt)).scalars().all())
+        if not user_ids:
+            return
+
+        task_stmt = select(Task.id).where(Task.user_id.in_(user_ids))
+        task_ids = list((await session.execute(task_stmt)).scalars().all())
+        if not task_ids:
+            # Clean up any lingering approvals created by integration test users
+            approval_stmt = select(Approval.id).where(
+                Approval.approved_by.in_(INTEGRATION_TEST_USER_EMAILS)
+            )
+            approval_ids = list((await session.execute(approval_stmt)).scalars().all())
+            if approval_ids:
+                await session.execute(
+                    delete(Approval).where(Approval.id.in_(approval_ids))
+                )
+                await session.commit()
+            return
+
+        exec_stmt = select(Execution.id).where(Execution.task_id.in_(task_ids))
+        exec_ids = list((await session.execute(exec_stmt)).scalars().all())
+
+        # 1. execution_steps (FK -> executions.id)
+        if exec_ids:
+            await session.execute(
+                delete(ExecutionStep).where(ExecutionStep.execution_id.in_(exec_ids))
+            )
+
+        # 2. artifacts (FK -> tasks.id, executions.id)
+        if exec_ids:
+            await session.execute(
+                delete(Artifact).where(
+                    (Artifact.task_id.in_(task_ids)) | (Artifact.execution_id.in_(exec_ids))
+                )
+            )
+        else:
+            await session.execute(
+                delete(Artifact).where(Artifact.task_id.in_(task_ids))
+            )
+
+        # 3. execution_events (FK -> tasks.id, execution_id)
+        if exec_ids:
+            await session.execute(
+                delete(ExecutionEvent).where(
+                    (ExecutionEvent.task_id.in_(task_ids)) | (ExecutionEvent.execution_id.in_(exec_ids))
+                )
+            )
+        else:
+            await session.execute(
+                delete(ExecutionEvent).where(ExecutionEvent.task_id.in_(task_ids))
+            )
+
+        # 4. executions (FK -> tasks.id, approvals.id)
+        if exec_ids:
+            await session.execute(
+                delete(Execution).where(Execution.id.in_(exec_ids))
+            )
+
+        # 5. approvals (FK -> tasks.id, approved_by)
+        await session.execute(
+            delete(Approval).where(
+                (Approval.task_id.in_(task_ids))
+                | (Approval.approved_by.in_(INTEGRATION_TEST_USER_EMAILS))
+            )
+        )
+
+        # 6. task_plans (FK -> tasks.id)
+        await session.execute(
+            delete(TaskPlan).where(TaskPlan.task_id.in_(task_ids))
+        )
+
+        # 7. tasks (FK -> users.id)
+        await session.execute(
+            delete(Task).where(Task.id.in_(task_ids))
+        )
+
+        await session.commit()
+
+
 @asynccontextmanager
 async def postgres_test_context():
     """
@@ -55,8 +158,9 @@ async def postgres_test_context():
     1. Validates test database URL safety.
     2. Runs Alembic migrations against the test database.
     3. Overrides FastAPI get_db dependency with isolated PostgreSQL session factory.
-    4. Deterministically restores all environment variables and dependency overrides in cleanup.
-    5. Disposes the async engine cleanly.
+    4. Deterministically cleans up integration test data before yielding and in finally.
+    5. Deterministically restores all environment variables and dependency overrides in cleanup.
+    6. Disposes the async engine cleanly.
     """
     assert TEST_POSTGRES_URL is not None
     try:
@@ -92,9 +196,18 @@ async def postgres_test_context():
     prev_override = app.dependency_overrides.get(get_db)
     app.dependency_overrides[get_db] = override_postgres_get_db
 
+    # Clean up leftovers from previous interrupted/failed runs before yielding
+    await cleanup_postgres_test_data(PgTestingSessionLocal)
+
     try:
         yield PgTestingSessionLocal
     finally:
+        # Clean up test data even if assertions fail
+        try:
+            await cleanup_postgres_test_data(PgTestingSessionLocal)
+        except Exception:
+            pass
+
         # Restore dependency overrides
         if prev_override is not None:
             app.dependency_overrides[get_db] = prev_override
