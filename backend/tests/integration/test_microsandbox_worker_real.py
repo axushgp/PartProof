@@ -411,4 +411,7 @@ async def test_real_microsandbox_stale_recovery_with_postgres(tmp_path):
             assert res_e2.status == "needs_reconciliation"
             assert res_t2.status == "needs_reconciliation"
             assert res_e2.cleanup_status == "leak_detected"
-            assert res_e2.worker_id is None
+            assert res_e2.worker_id is not None
+            assert res_e2.worker_id.startswith("reconciler-")
+            assert res_e2.lease_expires_at is None
+            assert res_e2.sandbox_id == "unverified-leak-sandbox-id-8888"

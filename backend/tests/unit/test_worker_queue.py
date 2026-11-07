@@ -621,6 +621,10 @@ async def test_unverified_sandbox_cleanup_marks_needs_reconciliation(db_session:
     assert execution.status == "needs_reconciliation"
     assert execution.cleanup_status == "leak_detected"
     assert task.status == "needs_reconciliation"
+    assert execution.worker_id is not None
+    assert execution.worker_id.startswith("reconciler-")
+    assert execution.lease_expires_at is None
+    assert execution.sandbox_id == "leaked-microvm-001"
 
 
 @pytest.mark.asyncio
