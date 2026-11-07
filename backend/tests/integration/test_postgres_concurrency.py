@@ -66,6 +66,8 @@ INTEGRATION_TEST_USER_EMAILS = (
     "auth_verify@partproof-test.io",
     "test_auditor@partproof-test.io",
     "worker_queue_concurrency@partproof.io",
+    "real-worker-test@partproof.io",
+    "stale-test@partproof.io",
 )
 
 
@@ -838,5 +840,134 @@ async def test_postgres_cleanup_lifecycle_success():
             # User must be preserved
             u_rec = await session.get(User, seeded_user_id)
             assert u_rec is not None, "User should be preserved across cleanups"
+
+
+@pytest.mark.asyncio
+async def test_postgres_cleanup_handles_microsandbox_worker_and_stale_users():
+    """
+    Verifies that cleanup_postgres_test_data() removes all tasks, executions,
+    approvals, plans, steps, events, and artifacts for real-worker-test@partproof.io
+    and stale-test@partproof.io while preserving their User records.
+    """
+    seeded_data = {}
+
+    async with postgres_test_context() as PgTestingSessionLocal:
+        async with PgTestingSessionLocal() as session:
+            # 1. Seed real-worker-test user & dependent entities
+            u1_res = await session.execute(
+                select(User).where(User.email == "real-worker-test@partproof.io")
+            )
+            u1 = u1_res.scalar_one_or_none()
+            if not u1:
+                u1 = User(
+                    email="real-worker-test@partproof.io",
+                    password_hash=get_password_hash("WorkerPass2026!"),
+                    role="auditor",
+                )
+                session.add(u1)
+                await session.flush()
+
+            # 2. Seed stale-test user & dependent entities
+            u2_res = await session.execute(
+                select(User).where(User.email == "stale-test@partproof.io")
+            )
+            u2 = u2_res.scalar_one_or_none()
+            if not u2:
+                u2 = User(
+                    email="stale-test@partproof.io",
+                    password_hash=get_password_hash("StalePass2026!"),
+                    role="auditor",
+                )
+                session.add(u2)
+                await session.flush()
+
+            # Tasks
+            t1 = Task(user_id=u1.id, title="MicroSandbox Real Worker Task", description="worker e2e", status="queued")
+            t2 = Task(user_id=u2.id, title="Stale Recovery Task", description="stale recovery", status="running")
+            session.add_all([t1, t2])
+            await session.flush()
+
+            # Plan for task 1
+            plan1 = TaskPlan(
+                task_id=t1.id,
+                model="glm-5.3",
+                plan_json={"title": "plan"},
+                plan_hash="worker-plan-hash-12345",
+                policy_result={"decision": "pass"},
+            )
+            session.add(plan1)
+
+            # Approval for task 1
+            appr1 = Approval(
+                task_id=t1.id,
+                approved_by=u1.email,
+                approved_plan_hash="worker-plan-hash-12345",
+                decision="approved",
+            )
+            session.add(appr1)
+            await session.flush()
+
+            # Executions
+            e1 = Execution(task_id=t1.id, approval_id=appr1.id, status="queued")
+            e2 = Execution(task_id=t2.id, status="running")
+            session.add_all([e1, e2])
+            await session.flush()
+
+            # Steps
+            s1 = ExecutionStep(execution_id=e1.id, step_number=1, description="step 1")
+            session.add(s1)
+
+            # Events
+            ev1 = ExecutionEvent(task_id=t1.id, execution_id=e1.id, event_type="log", message="running")
+            ev2 = ExecutionEvent(task_id=t2.id, execution_id=e2.id, event_type="log", message="stale")
+            session.add_all([ev1, ev2])
+
+            # Artifacts
+            art1 = Artifact(
+                task_id=t1.id,
+                execution_id=e1.id,
+                filename="worker_output.csv",
+                storage_key="worker/output.csv",
+                size_bytes=100,
+                sha256="abc123456",
+            )
+            session.add(art1)
+            await session.commit()
+
+            seeded_data = {
+                "u1_id": u1.id,
+                "u2_id": u2.id,
+                "t1_id": t1.id,
+                "t2_id": t2.id,
+                "plan1_id": plan1.id,
+                "appr1_id": appr1.id,
+                "e1_id": e1.id,
+                "e2_id": e2.id,
+                "s1_id": s1.id,
+                "ev1_id": ev1.id,
+                "ev2_id": ev2.id,
+                "art1_id": art1.id,
+            }
+
+    # Outside the first context: post-cleanup ran!
+    # Re-enter context to verify cleanup purged all dependent records but preserved User records
+    async with postgres_test_context() as PgTestingSessionLocal:
+        async with PgTestingSessionLocal() as session:
+            # Users must be preserved
+            assert (await session.get(User, seeded_data["u1_id"])) is not None
+            assert (await session.get(User, seeded_data["u2_id"])) is not None
+
+            # All dependent records must be deleted
+            assert (await session.get(Task, seeded_data["t1_id"])) is None
+            assert (await session.get(Task, seeded_data["t2_id"])) is None
+            assert (await session.get(TaskPlan, seeded_data["plan1_id"])) is None
+            assert (await session.get(Approval, seeded_data["appr1_id"])) is None
+            assert (await session.get(Execution, seeded_data["e1_id"])) is None
+            assert (await session.get(Execution, seeded_data["e2_id"])) is None
+            assert (await session.get(ExecutionStep, seeded_data["s1_id"])) is None
+            assert (await session.get(ExecutionEvent, seeded_data["ev1_id"])) is None
+            assert (await session.get(ExecutionEvent, seeded_data["ev2_id"])) is None
+            assert (await session.get(Artifact, seeded_data["art1_id"])) is None
+
 
 
