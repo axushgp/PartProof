@@ -1,9 +1,18 @@
+import json
 import os
 import platform
 import uuid
-from typing import List
+from typing import Annotated, List
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+try:
+    from pydantic_settings import NoDecode
+except ImportError:
+    try:
+        from pydantic_settings.sources import NoDecode
+    except ImportError:
+        NoDecode = None
 
 INSECURE_DEFAULT_SECRET_KEYS = {
     "development-insecure-secret-key-32-chars-min-needed-here!",
@@ -21,8 +30,14 @@ INSECURE_DEFAULT_DEMO_PASSWORDS = {
 
 
 class Settings(BaseSettings):
+    _backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _root_dir = os.path.dirname(_backend_dir)
     model_config = SettingsConfigDict(
-        env_file=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"),
+        env_file=(
+            os.path.join(_root_dir, ".env"),
+            os.path.join(_backend_dir, ".env"),
+            ".env",
+        ),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -85,14 +100,58 @@ class Settings(BaseSettings):
     DEMO_USER_PASSWORD: str = Field(default="PartProofSecureDemo2026!")
 
     # CORS
-    CORS_ORIGINS: List[str] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"])
+    if NoDecode is not None:
+        CORS_ORIGINS: Annotated[List[str], NoDecode] = Field(
+            default=["http://localhost:3000", "http://127.0.0.1:3000"]
+        )
+    else:
+        CORS_ORIGINS: List[str] = Field(
+            default=["http://localhost:3000", "http://127.0.0.1:3000"]
+        )
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v):
         if isinstance(v, str):
-            return [i.strip() for i in v.split(",") if i.strip()]
+            stripped = v.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except Exception:
+                    pass
+            return [i.strip() for i in stripped.split(",") if i.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            return [str(i).strip() for i in v if str(i).strip()]
         return v
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        if NoDecode is None:
+            for source in (env_settings, dotenv_settings):
+                if hasattr(source, "decode_complex_value"):
+                    orig_decode = source.decode_complex_value
+
+                    def make_decode(orig):
+                        def decode_complex_value(field_name, field, value):
+                            if field_name == "CORS_ORIGINS":
+                                return value
+                            return orig(field_name, field, value)
+
+                        return decode_complex_value
+
+                    source.decode_complex_value = make_decode(orig_decode)
+        return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
     def validate_production_invariants(self):
         """Hard safety invariants for production environment."""
