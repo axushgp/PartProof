@@ -1,15 +1,32 @@
+import asyncio
+import logging
 import os
+import sys
+
+# Ensure backend root is on sys.path for direct CLI script execution
+backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if backend_root not in sys.path:
+    sys.path.insert(0, backend_root)
+
 import pytest
 from app.core.config import settings
 from app.schemas.plan import TaskPlanSchema
 from app.services.inference.planner import TaskPlanner
 from app.services.inference.vultr_client import VultrInferenceClient
 
-# This test requires a live Vultr Serverless Inference API key and explicit opt-in:
-# RUN_VULTR_INFERENCE_INTEGRATION=1
+logger = logging.getLogger("partproof.diagnostic")
+
+# Diagnostic integration check: Distinguishes real live provider calls from mocked unit tests
+LIVE_API_KEY_PRESENT = bool(settings.VULTR_INFERENCE_API_KEY or os.environ.get("VULTR_INFERENCE_API_KEY"))
+OPT_IN = os.environ.get("RUN_VULTR_INFERENCE_INTEGRATION") == "1"
+
 pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_VULTR_INFERENCE_INTEGRATION") != "1" or not os.environ.get("VULTR_INFERENCE_API_KEY"),
-    reason="Requires live Vultr Serverless Inference API key and RUN_VULTR_INFERENCE_INTEGRATION=1",
+    not LIVE_API_KEY_PRESENT or not OPT_IN,
+    reason=(
+        "Live Vultr Serverless Inference diagnostic test. "
+        "Requires active VULTR_INFERENCE_API_KEY and RUN_VULTR_INFERENCE_INTEGRATION=1. "
+        "(Distinguishes real provider integration from mocked unit tests)"
+    ),
 )
 
 
@@ -25,45 +42,74 @@ async def test_live_vultr_inference_health():
         assert health.status == "reachable", f"Vultr inference health check failed: {health.message}"
         assert health.latency_ms is not None
         assert health.latency_ms > 0
+        print(f"\n[DIAGNOSTIC] Vultr Health: status={health.status} latency={health.latency_ms}ms model={health.model}")
 
 
 @pytest.mark.asyncio
 async def test_live_vultr_task_planning_glm():
     """
     Validates end-to-end task planning via Vultr Serverless Inference with model glm-5.3:
-    1. Authenticates against https://api.vultrinference.com/v1.
+    1. Authenticates against https://api.vultrinference.com/v1 with max_retries=0.
     2. Issues structured planning prompt for an offline engineering calculation.
-    3. Receives GLM-5.3 completion.
+    3. Receives GLM-5.3 completion with extra_body reasoning_effort='low'.
     4. Parses JSON and verifies full Pydantic TaskPlanSchema compliance.
-    5. Verifies token usage and latency telemetry.
-    Uses async context managers for clean HTTP client teardown.
+    5. Verifies token usage, finish_reason, and latency telemetry.
     """
     async with VultrInferenceClient() as client:
         async with TaskPlanner(client=client) as planner:
             task_description = (
-                "Generate a Python program that calculates the first 10 prime numbers "
-                "and writes them into a CSV file named '/workspace/output/primes.csv'."
+                "Generate a Python script that calculates statistical mean and standard deviation "
+                "for part dimension measurements and writes summary to '/workspace/output/stats.json'."
             )
 
             plan, metadata = await planner.plan_task(task_description)
 
-            # 1. Schema validation
-            assert isinstance(plan, TaskPlanSchema)
-            assert len(plan.title) > 0
-            assert len(plan.steps) >= 1
-            assert len(plan.steps) <= 3
-
-            # 2. Step safety validation
-            for step in plan.steps:
-                assert step.execution_type == "python"
-                assert len(step.code.strip()) > 0
-                assert "def " in step.code or "print" in step.code or "with open" in step.code or "for " in step.code
-
-            # 3. Artifact specification
-            assert "primes.csv" in plan.expected_artifacts or any(a.endswith(".csv") for a in plan.expected_artifacts)
-
-            # 4. Metadata verification
+            # 1. Distinguish real provider integration from mocks:
             assert metadata.provider == "vultr"
             assert metadata.model in [settings.VULTR_INFERENCE_MODEL, settings.VULTR_INFERENCE_FALLBACK_MODEL]
             assert metadata.latency_ms > 0
             assert metadata.total_tokens is not None and metadata.total_tokens > 0
+            assert metadata.finish_reason in ["stop", "eos", None]
+
+            # 2. Strict Schema Validation
+            assert isinstance(plan, TaskPlanSchema)
+            assert len(plan.title.strip()) > 0
+            assert len(plan.summary.strip()) > 0
+            assert 1 <= len(plan.steps) <= 3
+
+            # 3. Step Safety & Code Integrity
+            for step in plan.steps:
+                assert step.execution_type == "python"
+                assert len(step.code.strip()) > 0
+                assert "/workspace/output" in step.code or "stats.json" in step.code
+
+            # 4. Expected Artifacts
+            assert "stats.json" in plan.expected_artifacts or any(a.endswith(".json") for a in plan.expected_artifacts)
+
+            print(
+                f"\n[DIAGNOSTIC SUCCESS] Plan '{plan.title}' generated by model '{metadata.model}' in {metadata.latency_ms}ms. "
+                f"Tokens: prompt={metadata.prompt_tokens}, completion={metadata.completion_tokens}, total={metadata.total_tokens}, "
+                f"reasoning={metadata.reasoning_tokens}. Steps: {len(plan.steps)}."
+            )
+
+
+async def run_standalone_diagnostic():
+    """CLI diagnostic runner to test real Vultr inference directly without pytest flags."""
+    api_key = settings.VULTR_INFERENCE_API_KEY or os.environ.get("VULTR_INFERENCE_API_KEY")
+    if not api_key:
+        print("[DIAGNOSTIC NOTICE] VULTR_INFERENCE_API_KEY is not configured.")
+        print("This diagnostic confirms that real Vultr integration is gated and distinguished from mocked unit tests.")
+        return 0
+
+    print(f"[DIAGNOSTIC] Connecting to {settings.VULTR_INFERENCE_BASE_URL} with primary '{settings.VULTR_INFERENCE_MODEL}'...")
+    async with VultrInferenceClient() as client:
+        async with TaskPlanner(client=client) as planner:
+            desc = "Calculate the first 5 Fibonacci numbers and write to /workspace/output/fib.csv"
+            plan, meta = await planner.plan_task(desc)
+            print(f"[DIAGNOSTIC OK] Model: {meta.model}, Latency: {meta.latency_ms}ms, Total Tokens: {meta.total_tokens}")
+            print(f"[DIAGNOSTIC OK] Plan Title: {plan.title}, Steps: {len(plan.steps)}, Artifacts: {plan.expected_artifacts}")
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(run_standalone_diagnostic()))

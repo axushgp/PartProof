@@ -7,6 +7,12 @@ from app.core.config import settings
 from app.models.entities import Approval, Execution, Task, TaskPlan
 from app.schemas.plan import TaskPlanSchema
 from app.services.inference.base import InferenceMetadata
+from app.services.inference.exceptions import (
+    InferenceAuthError,
+    InferenceProviderError,
+    InferenceTimeoutError,
+    PlanValidationError,
+)
 
 MOCK_VALID_PLAN = TaskPlanSchema(
     title="Automated BOM Audit",
@@ -313,3 +319,95 @@ async def test_plan_regeneration_rejected_when_already_planning(
     regen_resp = await client.post(f"/api/v1/tasks/{task_id}/plan", headers=headers)
     assert regen_resp.status_code == 409
     assert "currently undergoing planning" in regen_resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_task_creation_inference_timeout_returns_504(client: AsyncClient):
+    """Verifies that an InferenceTimeoutError during task creation maps to 504 Gateway Timeout."""
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        side_effect=InferenceTimeoutError("Vultr inference request timed out after fallback", model="glm-5.3-flash"),
+    ):
+        resp = await client.post(
+            "/api/v1/tasks",
+            json={"description": "Task that triggers inference timeout"},
+            headers=headers,
+        )
+        assert resp.status_code == 504
+        assert "timed out" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_task_creation_connection_error_returns_503(client: AsyncClient):
+    """Verifies that a provider network connection error maps to 503 Service Unavailable."""
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        side_effect=InferenceProviderError("Connection error to Vultr endpoint", status_code=503, model="glm-5.3"),
+    ):
+        resp = await client.post(
+            "/api/v1/tasks",
+            json={"description": "Task that triggers connection error"},
+            headers=headers,
+        )
+        assert resp.status_code == 503
+        assert "Connection error" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_task_creation_auth_error_returns_502(client: AsyncClient):
+    """Verifies that an upstream provider auth failure maps to 502 Bad Gateway without logging out user."""
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        side_effect=InferenceAuthError("Invalid API key", model="glm-5.3"),
+    ):
+        resp = await client.post(
+            "/api/v1/tasks",
+            json={"description": "Task that triggers provider auth failure"},
+            headers=headers,
+        )
+        assert resp.status_code == 502
+        assert "Upstream AI inference authentication" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_task_creation_validation_error_returns_422(client: AsyncClient):
+    """Verifies that PlanValidationError maps to 422 Unprocessable Entity."""
+    login_resp = await client.post(
+        "/api/v1/auth/login",
+        json={"email": settings.DEMO_USER_EMAIL, "password": settings.DEMO_USER_PASSWORD},
+    )
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with patch(
+        "app.api.v1.endpoints.tasks.TaskPlanner.plan_task",
+        side_effect=PlanValidationError("Step code violates safety constraints"),
+    ):
+        resp = await client.post(
+            "/api/v1/tasks",
+            json={"description": "Task with plan validation failure"},
+            headers=headers,
+        )
+        assert resp.status_code == 422
+        assert "Task planning failed" in resp.json()["detail"]

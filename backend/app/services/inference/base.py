@@ -19,6 +19,8 @@ class InferenceMetadata(BaseModel):
     total_tokens: Optional[int] = None
     latency_ms: float
     retries: int = 0
+    finish_reason: Optional[str] = None
+    reasoning_tokens: Optional[int] = None
 
 
 class InferenceResponse(BaseModel):

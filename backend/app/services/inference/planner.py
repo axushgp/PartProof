@@ -104,6 +104,8 @@ class TaskPlanner:
         task_description: str,
         model: Optional[str] = None,
         input_provenance: Optional[TaskInputProvenance] = None,
+        max_completion_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Tuple[TaskPlanSchema, InferenceMetadata]:
         """
         Coordinates full planning flow: prompt preparation, inference, parsing, and validation.
@@ -119,12 +121,28 @@ class TaskPlanner:
                 messages=messages,
                 model=model,
                 response_format={"type": "json_object"},
+                max_completion_tokens=max_completion_tokens,
+                reasoning_effort=reasoning_effort,
             )
         except Exception as e:
             logger.error(f"Inference call failed during planning: {e}")
             raise e
 
+        meta = inference_resp.metadata
+        logger.info(
+            f"Planner received inference completion: model={meta.model} latency={meta.latency_ms}ms "
+            f"prompt_tokens={meta.prompt_tokens} completion_tokens={meta.completion_tokens} "
+            f"total_tokens={meta.total_tokens} reasoning_tokens={meta.reasoning_tokens} "
+            f"finish_reason={meta.finish_reason}"
+        )
+
         raw_content = inference_resp.content
+        if not raw_content or not raw_content.strip():
+            raise PlanValidationError(
+                f"Model '{meta.model}' returned empty content (finish_reason={meta.finish_reason}).",
+                raw_output=raw_content,
+            )
+
         cleaned_json = self._clean_json_content(raw_content)
 
         # Parse JSON

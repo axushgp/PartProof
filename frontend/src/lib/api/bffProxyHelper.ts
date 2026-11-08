@@ -111,6 +111,22 @@ export async function forwardToUpstream(
     });
   } catch (error) {
     console.error("Upstream connection failure:", error instanceof Error ? error.message : "Network error");
+    const isTimeout =
+      error instanceof Error &&
+      (error.name === "TimeoutError" ||
+        error.name === "AbortError" ||
+        ("code" in error &&
+          (error as { code: string }).code === "UND_ERR_CONNECT_TIMEOUT"));
+
+    if (isTimeout) {
+      return NextResponse.json(
+        {
+          detail: "PartProof backend gateway timeout. The request exceeded the maximum wait time.",
+        },
+        { status: 504 }
+      );
+    }
+
     return NextResponse.json(
       {
         detail: "Unable to reach PartProof backend service. Ensure the backend is running and reachable.",

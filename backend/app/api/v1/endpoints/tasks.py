@@ -1,6 +1,7 @@
 import base64
 import copy
 import hashlib
+import logging
 import os
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -36,11 +37,45 @@ from app.schemas.execution import (
     ExecutionStepRead,
     TaskDetail,
 )
-from app.services.inference.exceptions import InferenceError, TaskPlanningError
+from app.services.inference.exceptions import (
+    InferenceAuthError,
+    InferenceConfigurationError,
+    InferenceError,
+    InferenceProviderError,
+    InferenceRateLimitError,
+    InferenceTimeoutError,
+    PlanValidationError,
+    TaskPlanningError,
+)
 from app.services.inference.planner import TaskPlanner
 from app.services.orchestration.plan_integrity import compute_plan_hash
 from app.services.policy.engine import DeterministicPolicyEngine
 from app.services.receipt import verify_execution_receipt
+
+logger = logging.getLogger("partproof.tasks")
+
+
+def _map_inference_exception(e: Exception) -> tuple[int, str]:
+    """Maps domain inference and planning exceptions to specific HTTP status codes and safe messages."""
+    if isinstance(e, InferenceTimeoutError):
+        return status.HTTP_504_GATEWAY_TIMEOUT, getattr(e, "message", str(e))
+    elif isinstance(e, InferenceRateLimitError):
+        return status.HTTP_429_TOO_MANY_REQUESTS, getattr(e, "message", str(e))
+    elif isinstance(e, (InferenceAuthError, InferenceConfigurationError)):
+        return (
+            status.HTTP_502_BAD_GATEWAY,
+            "Upstream AI inference authentication or configuration failed. Verify server API key configuration.",
+        )
+    elif isinstance(e, InferenceProviderError):
+        status_code = e.status_code if e.status_code in [502, 503, 504] else status.HTTP_502_BAD_GATEWAY
+        return status_code, getattr(e, "message", str(e))
+    elif isinstance(e, (PlanValidationError, TaskPlanningError)):
+        return status.HTTP_422_UNPROCESSABLE_ENTITY, getattr(e, "message", str(e))
+    elif isinstance(e, InferenceError):
+        status_code = getattr(e, "status_code", status.HTTP_502_BAD_GATEWAY)
+        return status_code, getattr(e, "message", str(e))
+    return status.HTTP_500_INTERNAL_SERVER_ERROR, str(e)
+
 
 router = APIRouter()
 
@@ -256,16 +291,18 @@ async def create_and_plan_task(
         await db.refresh(task_plan)
 
     except (InferenceError, TaskPlanningError) as e:
-        logger_status = "failed"
         task.status = "failed"
         await db.commit()
+        err_code, err_detail = _map_inference_exception(e)
+        logger.warning(f"Task planning rejected ({err_code}): {err_detail}")
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY if isinstance(e, InferenceError) else status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Task planning failed: {e.message if hasattr(e, 'message') else str(e)}",
+            status_code=err_code,
+            detail=f"Task planning failed: {err_detail}",
         )
     except Exception as e:
         task.status = "failed"
         await db.commit()
+        logger.error(f"Unexpected error during task planning: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Unexpected error during task planning: {str(e)}",
@@ -362,9 +399,11 @@ async def generate_or_regenerate_plan(
         if t_locked and t_locked.status != "cancelled":
             t_locked.status = "failed"
             await db.commit()
+        err_code, err_detail = _map_inference_exception(e)
+        logger.warning(f"Plan regeneration failed ({err_code}): {err_detail}")
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY if isinstance(e, InferenceError) else status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Plan generation failed: {str(e)}",
+            status_code=err_code,
+            detail=f"Plan generation failed: {err_detail}",
         )
 
     # 4. Re-acquire lock to atomically update Task and TaskPlan

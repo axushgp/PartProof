@@ -44,7 +44,16 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
         detail = (data as { detail: string }).detail;
       }
     } catch {
-      // Not JSON
+      // Not JSON or non-standard error body
+      if (res.status === 504) {
+        detail = "Inference gateway timeout (504): The planning operation exceeded the timeout limit.";
+      } else if (res.status === 503) {
+        detail = "Service temporarily unavailable (503): Unable to reach the inference provider.";
+      } else if (res.status === 502) {
+        detail = "Bad gateway (502): Inference provider or upstream service encountered an error.";
+      } else if (res.status === 429) {
+        detail = "Rate limit reached (429): Provider throughput limit exceeded. Please try again shortly.";
+      }
     }
     throw new ApiError(detail, res.status, data);
   }

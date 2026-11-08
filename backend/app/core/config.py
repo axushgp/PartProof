@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     VULTR_INFERENCE_TIMEOUT_SECONDS: int = Field(default=60)
     VULTR_INFERENCE_MAX_RETRIES: int = Field(default=3)
     VULTR_INFERENCE_TEMPERATURE: float = Field(default=0.1)
+    VULTR_INFERENCE_MAX_COMPLETION_TOKENS: int = Field(default=8192, description="Max completion token budget for planning inferences")
+    VULTR_INFERENCE_REASONING_EFFORT: str = Field(default="low", description="Reasoning effort ('low' | 'medium' | 'high')")
 
     # Planner Bounds
     MAX_PLAN_STEPS: int = Field(default=3)
