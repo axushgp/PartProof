@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Check, Copy, FileText, Info } from "lucide-react";
+import { Check, Copy, Download, FileText, Loader2, ShieldCheck } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,8 @@ interface ArtifactsTableProps {
 
 export function ArtifactsTable({ artifacts }: ArtifactsTableProps) {
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [errorMap, setErrorMap] = useState<Record<string, string | null>>({});
 
   const handleCopy = async (hash: string) => {
     try {
@@ -22,6 +24,45 @@ export function ArtifactsTable({ artifacts }: ArtifactsTableProps) {
       setTimeout(() => setCopiedHash(null), 2000);
     } catch {
       // Fallback
+    }
+  };
+
+  const handleDownload = async (art: ArtifactRead) => {
+    try {
+      setDownloadingId(art.id);
+      setErrorMap((prev) => ({ ...prev, [art.id]: null }));
+
+      const res = await fetch(`/api/artifacts/${encodeURIComponent(art.id)}/download`);
+      if (!res.ok) {
+        let errMsg = `Download failed (${res.status})`;
+        try {
+          const errData = await res.json();
+          if (errData && typeof errData.detail === "string") {
+            errMsg = errData.detail;
+          }
+        } catch {
+          // Response was not JSON
+        }
+        setErrorMap((prev) => ({ ...prev, [art.id]: errMsg }));
+        return;
+      }
+
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = art.filename || "artifact.bin";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setErrorMap((prev) => ({
+        ...prev,
+        [art.id]: err instanceof Error ? err.message : "Network error during download",
+      }));
+    } finally {
+      setDownloadingId(null);
     }
   };
 
@@ -38,18 +79,18 @@ export function ArtifactsTable({ artifacts }: ArtifactsTableProps) {
               Verified files emitted from guest filesystem with cryptographic SHA-256 digests
             </CardDescription>
           </div>
-          <Badge variant="outline" className="font-mono text-xs">
+          <Badge variant="outline" className="font-mono text-xs text-[#55D6C2] border-[#55D6C2]/30">
             Host Bound Verified
           </Badge>
         </div>
       </CardHeader>
 
       <CardContent className="pt-4 space-y-4">
-        {/* Backend limitation note */}
+        {/* Verification & Download Info */}
         <div className="rounded-md border border-white/8 bg-[#0B0E12] p-3 text-xs text-zinc-400 flex items-start gap-2.5">
-          <Info className="h-4 w-4 text-zinc-400 shrink-0 mt-0.5" />
+          <ShieldCheck className="h-4 w-4 text-[#55D6C2] shrink-0 mt-0.5" />
           <p className="leading-relaxed text-[11px]">
-            <strong className="text-zinc-300">Artifact Download Note:</strong> Direct binary artifact retrieval endpoint is currently a pending backend capability. Metadata, content size, and cryptographic SHA-256 checksums are verified on host and indexed below for audit trails.
+            <strong className="text-zinc-300">Authenticated Artifact Downloads:</strong> Verified files emitted from guest filesystem. Each artifact is cryptographically verified on the host against its recorded SHA-256 digest prior to streaming.
           </p>
         </div>
 
@@ -66,13 +107,16 @@ export function ArtifactsTable({ artifacts }: ArtifactsTableProps) {
                   <th scope="col" className="py-2.5 px-3">MIME Type</th>
                   <th scope="col" className="py-2.5 px-3">Size</th>
                   <th scope="col" className="py-2.5 px-3">SHA-256 Digest</th>
-                  <th scope="col" className="py-2.5 px-3 text-right">Created</th>
+                  <th scope="col" className="py-2.5 px-3">Created</th>
+                  <th scope="col" className="py-2.5 px-3 text-right">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.06]">
                 {artifacts.map((art) => {
                   const hash = art.sha256 || (art as unknown as { sha256_hash?: string }).sha256_hash || "";
                   const size = art.size_bytes ?? (art as unknown as { file_size_bytes?: number }).file_size_bytes ?? 0;
+                  const isDownloading = downloadingId === art.id;
+                  const error = errorMap[art.id];
 
                   return (
                     <tr key={art.id} className="hover:bg-white/[0.02] transition-colors">
@@ -114,8 +158,41 @@ export function ArtifactsTable({ artifacts }: ArtifactsTableProps) {
                         </div>
                       </td>
 
-                      <td className="py-3 px-3 text-right font-mono text-[11px] text-zinc-400 whitespace-nowrap">
+                      <td className="py-3 px-3 font-mono text-[11px] text-zinc-400 whitespace-nowrap">
                         {formatDate(art.created_at)}
+                      </td>
+
+                      <td className="py-3 px-3 text-right">
+                        <div className="flex flex-col items-end gap-1">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleDownload(art)}
+                            disabled={isDownloading}
+                            className="h-7 px-2.5 text-xs font-mono border-white/10 text-zinc-200 hover:text-white hover:bg-white/[0.06] gap-1.5"
+                            title={`Download ${art.filename}`}
+                          >
+                            {isDownloading ? (
+                              <>
+                                <Loader2 className="h-3 w-3 animate-spin text-[#55D6C2]" />
+                                <span>Downloading...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Download className="h-3 w-3 text-[#55D6C2]" />
+                                <span>Download</span>
+                              </>
+                            )}
+                          </Button>
+                          {error && (
+                            <span
+                              className="text-[10px] text-rose-400 font-mono max-w-[180px] truncate"
+                              title={error}
+                            >
+                              {error}
+                            </span>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );

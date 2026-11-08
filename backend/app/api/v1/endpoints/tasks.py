@@ -31,6 +31,7 @@ from app.services.inference.exceptions import InferenceError, TaskPlanningError
 from app.services.inference.planner import TaskPlanner
 from app.services.orchestration.plan_integrity import compute_plan_hash
 from app.services.policy.engine import DeterministicPolicyEngine
+from app.services.receipt import verify_execution_receipt
 
 router = APIRouter()
 
@@ -47,6 +48,14 @@ def _build_execution_read(execution: Execution) -> ExecutionRead:
         if "artifacts" in execution.__dict__ and execution.artifacts
         else []
     )
+    receipt_json = None
+    if execution.receipt_json:
+        receipt_json = dict(execution.receipt_json)
+        verification = verify_execution_receipt(receipt_json)
+        receipt_json["signature_verified"] = verification.signature_valid
+        if not verification.is_valid:
+            receipt_json["security_verified"] = False
+
     return ExecutionRead(
         id=execution.id,
         task_id=execution.task_id,
@@ -61,7 +70,7 @@ def _build_execution_read(execution: Execution) -> ExecutionRead:
         completed_at=execution.completed_at,
         exit_code=execution.exit_code,
         cleanup_status=execution.cleanup_status,
-        receipt_json=execution.receipt_json,
+        receipt_json=receipt_json,
         steps=steps,
         artifacts=artifacts,
     )
@@ -702,4 +711,24 @@ async def cancel_task(
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"Cannot cancel task in state '{task.status}'.",
+    )
+
+
+@router.get("/{task_id}/artifacts/{artifact_id}/download")
+async def download_task_artifact(
+    task_id: str,
+    artifact_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Authenticated task-scoped artifact download endpoint.
+    Verifies that the artifact belongs to the specified task and the user is authorized.
+    """
+    from app.api.v1.endpoints.artifacts import download_artifact
+    return await download_artifact(
+        artifact_id=artifact_id,
+        current_user=current_user,
+        db=db,
+        expected_task_id=task_id,
     )

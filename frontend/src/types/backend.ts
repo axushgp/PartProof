@@ -187,7 +187,20 @@ export interface ExecutionReceipt {
   artifacts: ArtifactRead[];
   security_verified: boolean;
   verification_hash: string;
+  receipt_digest?: string;
   signature?: string;
+  signature_scheme?: string;
+  signature_verified?: boolean;
+  key_id?: string;
+  receipt_version?: string;
+  approved_plan_hash?: string | null;
+  timeout_seconds?: number;
+  steps?: {
+    step_number: number;
+    description: string;
+    status: string;
+    exit_code?: number | null;
+  }[];
 }
 
 export interface ExecutionRead {

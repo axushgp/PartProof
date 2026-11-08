@@ -1,12 +1,15 @@
-from fastapi import APIRouter, Depends
+from typing import Any, Dict, Optional
+from fastapi import APIRouter, Depends, Body
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 from app.api.deps import get_inference_client
 from app.core.config import settings
 from app.database.session import get_db
 from app.schemas.system import HealthResponse, SystemStatus
 from app.services.inference.base import ProviderHealth
 from app.services.inference.vultr_client import VultrInferenceClient
+from app.services.receipt import get_receipt_signer, verify_execution_receipt, ReceiptVerificationResult
 
 router = APIRouter()
 
@@ -72,3 +75,39 @@ async def check_inference_provider(
     Uses the managed inference client to prevent HTTP connection leaks.
     """
     return await client.check_health()
+
+
+class ReceiptVerificationRequest(BaseModel):
+    receipt: Dict[str, Any]
+    expected_plan_hash: Optional[str] = None
+
+
+@router.get("/system/verification-key")
+async def get_verification_key():
+    """
+    Returns the active Ed25519 public verification key and key ID.
+    Enables independent, offline or third-party verification of cryptographic execution receipts.
+    Private signing keys remain strictly server-side and are never exposed.
+    """
+    signer = get_receipt_signer()
+    return {
+        "key_id": signer.key_id,
+        "algorithm": "Ed25519",
+        "public_key_hex": signer.public_key_hex,
+        "public_key_b64": signer.public_key_b64,
+    }
+
+
+@router.post("/system/receipt-verify", response_model=ReceiptVerificationResult)
+async def verify_receipt_endpoint(
+    payload: ReceiptVerificationRequest,
+):
+    """
+    Independent verification endpoint for cryptographic execution receipts.
+    Evaluates Ed25519 digital signature, canonical SHA-256 digest integrity,
+    teardown verification status, and plan/artifact consistency.
+    """
+    return verify_execution_receipt(
+        receipt=payload.receipt,
+        expected_plan_hash=payload.expected_plan_hash,
+    )

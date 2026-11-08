@@ -20,6 +20,7 @@ from app.models.entities import (
     Task,
 )
 from app.services.artifacts.manager import ArtifactManager
+from app.services.receipt import get_receipt_signer
 from app.services.sandbox.base import (
     MultiStepExecutionResult,
     StepExecutionOutput,
@@ -501,7 +502,70 @@ class ExecutionWorker:
                 event_type = "execution_failed"
                 event_msg = result.error_message or "Execution failed with non-zero exit code."
 
-            # 2. Atomic conditional SQL update checking worker_id, active running status, AND unexpired lease
+            # 2. Build Cryptographic Execution Receipt if and only if cleanup was confirmed destroyed
+            exec_rec = await session.get(Execution, execution_id)
+            receipt_doc = None
+
+            if final_cleanup_status == "verified_destroyed" and exec_rec is not None:
+                try:
+                    steps_data = []
+                    if result and result.step_outputs:
+                        for s in result.step_outputs:
+                            steps_data.append({
+                                "step_number": s.step_number,
+                                "description": s.description or f"Step {s.step_number}",
+                                "status": s.status,
+                                "exit_code": s.exit_code,
+                            })
+                    else:
+                        steps_stmt = (
+                            select(ExecutionStep)
+                            .where(ExecutionStep.execution_id == execution_id)
+                            .order_by(ExecutionStep.step_number)
+                        )
+                        steps_res = await session.execute(steps_stmt)
+                        for s in steps_res.scalars().all():
+                            steps_data.append({
+                                "step_number": s.step_number,
+                                "description": s.description,
+                                "status": s.status,
+                                "exit_code": s.exit_code,
+                            })
+
+                    artifacts_data = []
+                    if result and result.artifacts:
+                        for a in result.artifacts:
+                            artifacts_data.append({
+                                "filename": a.filename,
+                                "size_bytes": a.size_bytes,
+                                "sha256": a.sha256,
+                            })
+
+                    signer = get_receipt_signer()
+                    receipt_doc = signer.sign_execution_receipt(
+                        task_id=task_id,
+                        execution_id=execution_id,
+                        approved_plan_hash=exec_rec.plan_hash,
+                        sandbox_id=exec_rec.sandbox_id,
+                        runtime_image=exec_rec.runtime_image,
+                        guest_kernel=result.guest_kernel if result and result.guest_kernel else exec_rec.guest_kernel,
+                        cpu_limit=exec_rec.cpu_limit,
+                        memory_limit_mb=exec_rec.memory_limit_mb,
+                        timeout_seconds=exec_rec.timeout_seconds,
+                        network_mode=exec_rec.network_mode,
+                        started_at=exec_rec.started_at,
+                        completed_at=now,
+                        duration_seconds=result.duration_seconds if result else None,
+                        exit_code=result.exit_code if result else (0 if target_status == "succeeded" else 1),
+                        status=target_status,
+                        cleanup_status=final_cleanup_status,
+                        steps=steps_data,
+                        artifacts=artifacts_data,
+                    )
+                except Exception as receipt_err:
+                    logger.error("Failed to generate cryptographic receipt for %s: %s", execution_id, receipt_err, exc_info=True)
+
+            # 3. Atomic conditional SQL update checking worker_id, active running status, AND unexpired lease
             stmt = (
                 update(Execution)
                 .where(
@@ -517,6 +581,7 @@ class ExecutionWorker:
                     exit_code=result.exit_code if result else 1,
                     cleanup_status=final_cleanup_status,
                     guest_kernel=result.guest_kernel if result else None,
+                    receipt_json=receipt_doc,
                     lease_expires_at=None,
                 )
             )
@@ -531,10 +596,20 @@ class ExecutionWorker:
                 )
                 return
 
-            # 3. Only mutate Task, add artifacts, and record events if the atomic update affected exactly the claimed row!
+            # 4. Only mutate Task, add artifacts, and record events if the atomic update affected exactly the claimed row!
             task_rec = await session.get(Task, task_id)
             if task_rec:
                 task_rec.status = task_status
+
+            event_metadata = {
+                "duration_seconds": result.duration_seconds if result else None,
+                "cleanup_status": final_cleanup_status,
+                "target_status": target_status,
+            }
+            if receipt_doc:
+                event_metadata["receipt_digest"] = receipt_doc.get("receipt_digest")
+                event_metadata["key_id"] = receipt_doc.get("key_id")
+                event_metadata["signature_scheme"] = "ed25519"
 
             session.add(
                 ExecutionEvent(
@@ -542,11 +617,7 @@ class ExecutionWorker:
                     execution_id=execution_id,
                     event_type=event_type,
                     message=event_msg,
-                    metadata_json={
-                        "duration_seconds": result.duration_seconds if result else None,
-                        "cleanup_status": final_cleanup_status,
-                        "target_status": target_status,
-                    },
+                    metadata_json=event_metadata,
                 )
             )
 

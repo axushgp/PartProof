@@ -36,22 +36,32 @@ class ArtifactRead(BaseModel):
 class ExecutionReceipt(BaseModel):
     task_id: str
     execution_id: str
-    sandbox_id: Optional[str]
+    sandbox_id: Optional[str] = None
     status: str
     runtime_image: str
-    guest_kernel: Optional[str]
+    guest_kernel: Optional[str] = None
     cpu_limit: int
     memory_limit_mb: int
+    timeout_seconds: Optional[int] = 30
     network_mode: str
-    started_at: Optional[datetime]
-    completed_at: Optional[datetime]
-    duration_seconds: Optional[float]
-    exit_code: Optional[int]
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    exit_code: Optional[int] = None
     cleanup_status: str
-    steps_executed: int
-    artifacts: List[ArtifactRead]
+    steps_executed: int = 0
+    artifacts: List[Any] = []
+    steps: Optional[List[Dict[str, Any]]] = None
     security_verified: bool
     verification_hash: str
+    receipt_digest: Optional[str] = None
+    signature: Optional[str] = None
+    signature_scheme: Optional[str] = "ed25519"
+    key_id: Optional[str] = None
+    receipt_version: Optional[str] = "1.0.0"
+    approved_plan_hash: Optional[str] = None
+    plan_hash: Optional[str] = None
+    signature_verified: Optional[bool] = None
 
 
 class ExecutionRead(BaseModel):

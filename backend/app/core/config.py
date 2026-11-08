@@ -2,7 +2,7 @@ import json
 import os
 import platform
 import uuid
-from typing import Annotated, List
+from typing import Annotated, List, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     DEMO_USER_EMAIL: str = Field(default="auditor@partproof.io")
     DEMO_USER_PASSWORD: str = Field(default="PartProofSecureDemo2026!")
 
+    # Cryptographic Execution Receipt Signing (Ed25519)
+    RECEIPT_KEY_ID: str = Field(default="partproof-ed25519-v1", description="Identifier for active Ed25519 signing key")
+    RECEIPT_SIGNING_KEY: Optional[str] = Field(default=None, description="Base64/Hex 32-byte Ed25519 private key or PKCS8 PEM")
+    RECEIPT_SIGNING_KEY_PATH: Optional[str] = Field(default=None, description="Path to file containing Ed25519 private key")
+
     # CORS
     if NoDecode is not None:
         CORS_ORIGINS: Annotated[List[str], NoDecode] = Field(
@@ -177,6 +182,11 @@ class Settings(BaseSettings):
                 raise RuntimeError(
                     "CRITICAL SECURITY INVARIANT VIOLATION: "
                     "Default predictable demo user password is not permitted in production."
+                )
+            if not self.RECEIPT_SIGNING_KEY and not self.RECEIPT_SIGNING_KEY_PATH:
+                raise RuntimeError(
+                    "CRITICAL SECURITY INVARIANT VIOLATION: "
+                    "RECEIPT_SIGNING_KEY or RECEIPT_SIGNING_KEY_PATH is mandatory in production for cryptographic receipts."
                 )
 
     def validate_worker_production_invariants(self):

@@ -270,10 +270,15 @@ describe("Execution Receipt & Artifacts", () => {
   });
 
   describe("ExecutionReceiptCard Component", () => {
-    it("renders cryptographic receipt with verified badge and evidence parameters when receipt is present", () => {
+    it("renders cryptographic receipt with verified badge, Ed25519 signature status, and evidence parameters when receipt is present", () => {
       render(
         <ExecutionReceiptCard
-          receipt={mockReceipt}
+          receipt={{
+            ...mockReceipt,
+            key_id: "partproof-ed25519-v1",
+            signature_scheme: "ed25519",
+            signature_verified: true,
+          }}
           execution={mockExecution}
           approvedPlanHash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         />
@@ -281,14 +286,46 @@ describe("Execution Receipt & Artifacts", () => {
 
       expect(screen.getByText("Cryptographic Execution Receipt")).toBeInTheDocument();
       expect(screen.getByText("SECURITY VERIFIED")).toBeInTheDocument();
+      expect(screen.getByText("Cryptographic Receipt Available")).toBeInTheDocument();
+      expect(screen.getByText("Ed25519 Signature Verified")).toBeInTheDocument();
+      expect(screen.getByText(/Algorithm: ED25519 · Key ID: partproof-ed25519-v1/)).toBeInTheDocument();
       expect(screen.getByText("exec-100")).toBeInTheDocument();
       expect(screen.getByText("guest-microsandbox-prod-42")).toBeInTheDocument();
+      expect(screen.getByText("vmlinux-6.6")).toBeInTheDocument();
+      expect(screen.getByText("1 vCPU / 512 MB")).toBeInTheDocument();
+      expect(screen.getByText(/none/i)).toBeInTheDocument();
       expect(screen.getByText("5.2s")).toBeInTheDocument();
       expect(screen.getByText("0")).toBeInTheDocument();
       expect(screen.getByText("Exit Code")).toBeInTheDocument();
       expect(
         screen.getByText("7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069")
       ).toBeInTheDocument();
+    });
+
+    it("renders Signature Invalid badge and VERIFICATION FAILED when signature_verified is false", () => {
+      render(
+        <ExecutionReceiptCard
+          receipt={{
+            ...mockReceipt,
+            signature_verified: false,
+          }}
+          execution={mockExecution}
+        />
+      );
+
+      expect(screen.getByText("Signature Invalid")).toBeInTheDocument();
+      expect(screen.getByText("VERIFICATION FAILED / UNVERIFIED")).toBeInTheDocument();
+    });
+
+    it("renders Legacy execution: receipt unavailable notice when receipt is null", () => {
+      render(
+        <ExecutionReceiptCard
+          receipt={null}
+          execution={mockExecution}
+        />
+      );
+
+      expect(screen.getByText(/Legacy execution: receipt unavailable/)).toBeInTheDocument();
     });
 
     it("copies the verification hash to clipboard when copy button is clicked", async () => {
@@ -504,19 +541,84 @@ describe("Execution Receipt & Artifacts", () => {
       },
     ];
 
-    it("displays pending download note and does NOT render fake 404 download hrefs", () => {
+    it("renders authenticated download info note and download action button for each artifact", () => {
       render(<ArtifactsTable artifacts={mockArtifacts} />);
 
-      expect(screen.getByText(/Artifact Download Note:/i)).toBeInTheDocument();
-      expect(
-        screen.getByText(/pending backend capability/i)
-      ).toBeInTheDocument();
+      expect(screen.getByText(/Authenticated Artifact Downloads:/i)).toBeInTheDocument();
+      expect(screen.getByText(/Host Bound Verified/i)).toBeInTheDocument();
 
-      const downloadLinks = screen.queryAllByRole("link");
-      const fakeDownloadLink = downloadLinks.find((link) =>
-        link.getAttribute("href")?.includes("/download")
-      );
-      expect(fakeDownloadLink).toBeUndefined();
+      const downloadButton = screen.getByRole("button", { name: /Download/i });
+      expect(downloadButton).toBeInTheDocument();
+      expect(downloadButton).toHaveAttribute("title", "Download audit-report.json");
+    });
+
+    it("triggers file download via authenticated BFF route when Download button is clicked", async () => {
+      const user = userEvent.setup();
+      const mockCreateObjectURL = vi.fn().mockReturnValue("blob:http://localhost/dummy");
+      const mockRevokeObjectURL = vi.fn();
+      window.URL.createObjectURL = mockCreateObjectURL;
+      window.URL.revokeObjectURL = mockRevokeObjectURL;
+
+      const mockBlob = new Blob(['{"audit": true}'], { type: "application/json" });
+      const fetchSpy = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        blob: () => Promise.resolve(mockBlob),
+        headers: new Headers({
+          "content-type": "application/json",
+          "content-disposition": 'attachment; filename="audit-report.json"',
+        }),
+      });
+      global.fetch = fetchSpy;
+
+      render(<ArtifactsTable artifacts={mockArtifacts} />);
+
+      const downloadButton = screen.getByRole("button", { name: /Download/i });
+      await user.click(downloadButton);
+
+      await waitFor(() => {
+        expect(fetchSpy).toHaveBeenCalledWith("/api/artifacts/art-1/download");
+        expect(mockCreateObjectURL).toHaveBeenCalled();
+        expect(mockRevokeObjectURL).toHaveBeenCalledWith("blob:http://localhost/dummy");
+      });
+    });
+
+    it("displays meaningful error message when download fails with non-ok response", async () => {
+      const user = userEvent.setup();
+      const fetchSpy = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+        json: () => Promise.resolve({ detail: "Access denied: task belongs to another user" }),
+      });
+      global.fetch = fetchSpy;
+
+      render(<ArtifactsTable artifacts={mockArtifacts} />);
+
+      const downloadButton = screen.getByRole("button", { name: /Download/i });
+      await user.click(downloadButton);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Access denied: task belongs to another user/i)).toBeInTheDocument();
+      });
+    });
+
+    it("handles download failure when integrity verification fails (409)", async () => {
+      const user = userEvent.setup();
+      const fetchSpy = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        json: () => Promise.resolve({ detail: "Artifact integrity verification failed: SHA-256 digest mismatch" }),
+      });
+      global.fetch = fetchSpy;
+
+      render(<ArtifactsTable artifacts={mockArtifacts} />);
+
+      const downloadButton = screen.getByRole("button", { name: /Download/i });
+      await user.click(downloadButton);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Artifact integrity verification failed/i)).toBeInTheDocument();
+      });
     });
 
     it("renders artifact metadata including name, formatted size, and SHA-256 digest", () => {
