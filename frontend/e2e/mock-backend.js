@@ -603,6 +603,249 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+      // 9. Procurement Demo
+      if (method === "GET" && path === "/api/v1/procurement/demo") {
+        res.statusCode = 200;
+        res.end(
+          JSON.stringify({
+            title: "EV Powertrain Subsystem Assembly Procurement Audit",
+            budget_limit: 42000.0,
+            delivery_deadline_days: 30,
+            currency: "USD",
+            bom_items: [
+              {
+                item_id: "bom-001",
+                part_number: "BRG-6204-2RS",
+                description: "Deep Groove Ball Bearing 20x47x14mm C3",
+                category: "Bearings",
+                required_qty: 200,
+                uom: "pcs",
+                target_unit_price: 12.0,
+                currency: "USD",
+                spec_notes: "ABEC-5 precision",
+              },
+            ],
+            supplier_quotes: {
+              "sup-a": [
+                {
+                  quote_item_id: "qa-001",
+                  supplier_id: "sup-a",
+                  supplier_name: "Apex Industrial Components",
+                  part_number: "BRG-6204-2RS",
+                  description: "Deep Groove Ball Bearing",
+                  quoted_qty: 200,
+                  pack_size: 1,
+                  moq: 500,
+                  unit_price: 9.5,
+                  currency: "USD",
+                  tax_pct: 0.18,
+                  tax_inclusive: false,
+                  freight_terms: "excluded",
+                  freight_amount: 1850.0,
+                  lead_time_days: 25,
+                  warranty_months: 12,
+                  payment_terms: "Net 30",
+                },
+              ],
+              "sup-b": [
+                {
+                  quote_item_id: "qb-001",
+                  supplier_id: "sup-b",
+                  supplier_name: "Beacon Precision Dynamics",
+                  part_number: "BRG-6204-2RS",
+                  description: "Deep Groove Ball Bearing C3",
+                  quoted_qty: 200,
+                  pack_size: 1,
+                  moq: 200,
+                  unit_price: 11.8,
+                  currency: "USD",
+                  tax_pct: 0.18,
+                  tax_inclusive: false,
+                  freight_terms: "included",
+                  freight_amount: 0.0,
+                  lead_time_days: 21,
+                  warranty_months: 24,
+                  payment_terms: "Net 30",
+                },
+              ],
+            },
+          })
+        );
+        return;
+      }
+
+      // 10. Procurement Reconcile
+      if (method === "POST" && path === "/api/v1/procurement/reconcile") {
+        res.statusCode = 200;
+        res.end(
+          JSON.stringify({
+            budget_limit: 42000.0,
+            delivery_deadline_days: 30,
+            lowest_headline_supplier_id: "sup-a",
+            lowest_landed_cost_supplier_id: "sup-b",
+            best_compliant_supplier_id: "sup-b",
+            recommended_supplier_id: "sup-b",
+            recommendation_rationale:
+              "Beacon Precision Dynamics is recommended for award due to lowest compliant landed cost ($32,978.64). While Apex Industrial Components is technically and deadline compliant and offers a lower headline price ($25,680.00 vs $27,948.00), its $2,920.00 MOQ-induced excess inventory penalty and $1,850.00 unbundled freight push its true landed disbursement to $35,931.00, making it commercially more expensive by $2,952.36.",
+            suppliers: [
+              {
+                supplier_id: "sup-b",
+                supplier_name: "Beacon Precision Dynamics",
+                currency: "USD",
+                headline_price: 27948.0,
+                effective_purchased_qty_total: 1300.0,
+                moq_excess_cost: 0.0,
+                subtotal_with_excess: 27948.0,
+                freight_cost: 0.0,
+                tooling_cost: 0.0,
+                tax_amount: 5030.64,
+                true_landed_cost: 32978.64,
+                landed_cost_variance: 5030.64,
+                lead_time_days: 21,
+                warranty_months: 24,
+                payment_terms: "Net 30",
+                is_compliant: true,
+                compliance_status: "compliant",
+                commercial_status: "recommended",
+                compliance_issues: [],
+                line_item_details: [],
+              },
+              {
+                supplier_id: "sup-a",
+                supplier_name: "Apex Industrial Components",
+                currency: "USD",
+                headline_price: 25680.0,
+                effective_purchased_qty_total: 1800.0,
+                moq_excess_cost: 2920.0,
+                subtotal_with_excess: 28600.0,
+                freight_cost: 1850.0,
+                tooling_cost: 0.0,
+                tax_amount: 5481.0,
+                true_landed_cost: 35931.0,
+                landed_cost_variance: 10251.0,
+                lead_time_days: 25,
+                warranty_months: 12,
+                payment_terms: "Net 30",
+                is_compliant: true,
+                compliance_status: "compliant",
+                commercial_status: "expensive",
+                compliance_issues: [],
+                line_item_details: [],
+              },
+            ],
+            discrepancies: [
+              {
+                id: "disc-001",
+                supplier_id: "sup-a",
+                supplier_name: "Apex Industrial Components",
+                category: "MOQ-induced excess purchases",
+                severity: "critical",
+                part_number: "BRG-6204-2RS",
+                expected_value: "200 units",
+                quoted_value: "MOQ: 500 units (Excess: 300)",
+                financial_impact: 2850.0,
+                explanation: "MOQ enforces 300 dead inventory units.",
+              },
+            ],
+            split_award_recommended: false,
+            split_award_details: null,
+          })
+        );
+        return;
+      }
+
+      // 11. Procurement Replay
+      if (method === "POST" && path === "/api/v1/procurement/replay") {
+        res.statusCode = 200;
+        res.end(
+          JSON.stringify({
+            scenario_description: "Apex bearing MOQ 200 | Apex freight waived",
+            baseline_recommended_supplier_id: "sup-b",
+            new_recommended_supplier_id: "sup-a",
+            winner_changed: true,
+            baseline_landed_cost: 32978.64,
+            new_landed_cost: 30302.4,
+            projected_savings: 2676.24,
+            explanation:
+              "RECOMMENDATION SHIFT: Apex Industrial Components replaces Beacon Precision Dynamics as the recommended supplier. This shift delivers a net landed procurement savings of $2676.24 ($32978.64 -> $30302.40). Driver: Apex Industrial Components's landed cost dropped to $30302.40 due to reduced MOQ excess and waived freight.",
+            supplier_ranking_before: ["Beacon Precision Dynamics", "Apex Industrial Components"],
+            supplier_ranking_after: ["Apex Industrial Components", "Beacon Precision Dynamics"],
+            suppliers: [],
+          })
+        );
+        return;
+      }
+
+      // 12. Procurement Create Task
+      if (method === "POST" && path === "/api/v1/procurement/create-task") {
+        const taskId = `task-proc-${Date.now()}`;
+        const task = {
+          id: taskId,
+          user_id: MOCK_USER.id,
+          title: "Procurement Audit: EV Powertrain Subsystem",
+          description: "Deterministic forensic audit of 5 BOM items",
+          status: "awaiting_approval",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        tasks.unshift(task);
+
+        const newHash = "f5a1b2c3d4e5f67890123456789abcdef0123456789abcdef0123456789abcde0";
+        plans[taskId] = {
+          id: `plan-${taskId}`,
+          task_id: taskId,
+          model: "glm-5.3-procurement",
+          plan_json: {
+            title: task.title,
+            summary: "Deterministic forensic procurement audit",
+            reasoning_summary: "Executes isolated deterministic arithmetic",
+            steps: [
+              {
+                step_id: "step-1",
+                description: "Compute procurement landed costs",
+                code: "print('Auditing BOM...')",
+                execution_type: "python",
+              },
+            ],
+            expected_artifacts: [
+              "bom_audit.csv",
+              "supplier_comparison.csv",
+              "discrepancy_register.csv",
+              "procurement_decision.json",
+              "negotiation_brief.md",
+            ],
+            network_required: false,
+          },
+          plan_hash: newHash,
+          policy_result: {
+            allowed: true,
+            policy_name: "default-procurement-v1",
+            policy_version: "1.0",
+            network_mode: "none",
+            cpu_limit: 1,
+            memory_limit_mb: 512,
+            timeout_seconds: 30,
+            violations: [],
+            evaluated_at: new Date().toISOString(),
+          },
+          policy_version: "1.0",
+          approval_status: "pending",
+          created_at: new Date().toISOString(),
+        };
+
+        res.statusCode = 200;
+        res.end(
+          JSON.stringify({
+            task,
+            plan: plans[taskId],
+            latest_execution: null,
+            artifacts: [],
+            events: [],
+          })
+        );
+        return;
+      }
+
       // Fallback 404
       res.statusCode = 404;
       res.end(JSON.stringify({ detail: `Route not found: ${method} ${path}` }));

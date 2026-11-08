@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   Server,
   Cpu,
+  Scale,
 } from "lucide-react";
 import { Logo } from "@/components/layout/logo";
 import { UserMenu } from "@/components/layout/user-menu";
@@ -45,6 +46,12 @@ export function Sidebar({ user, className, onNavigate }: SidebarProps) {
       href: "/app",
       icon: LayoutDashboard,
       active: pathname === "/app",
+    },
+    {
+      title: "Procurement Forensics",
+      href: "/app/procurement",
+      icon: Scale,
+      active: pathname.startsWith("/app/procurement"),
     },
     {
       title: "Tasks & Audits",

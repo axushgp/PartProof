@@ -147,7 +147,45 @@ class MockSandboxAdapter(BaseSandboxAdapter):
         for raw_name in expected_names:
             safe_name = self.artifact_manager.sanitize_and_validate_filename(raw_name)
             
-            if safe_name.endswith(".csv"):
+            if safe_name == "bom_audit.csv":
+                content = (
+                    "item_id,part_number,description,category,required_qty,uom,target_price\n"
+                    "bom-001,BRG-6204-2RS,Deep Groove Ball Bearing,Bearings,200,pcs,12.00\n"
+                    "bom-002,FST-M8-ST-88,Hex Flange Bolt M8x35,Fasteners,800,pcs,0.45\n"
+                    "bom-003,CTR-BLDC-72V,72V 150A BLDC Controller,Electronics,100,pcs,185.00\n"
+                ).encode("utf-8")
+            elif safe_name == "supplier_comparison.csv":
+                content = (
+                    "supplier_id,supplier_name,headline_price,moq_excess_cost,freight_cost,tax_amount,true_landed_cost,is_compliant,compliance_status,commercial_status\n"
+                    "sup-b,Beacon Precision Dynamics,27948.00,0.00,0.00,5030.64,32978.64,YES,COMPLIANT,RECOMMENDED\n"
+                    "sup-a,Apex Industrial Components,25680.00,2920.00,1850.00,5481.00,35931.00,YES,COMPLIANT,EXPENSIVE\n"
+                    "sup-c,Crestline Manufacturing Group,26860.00,0.00,0.00,4834.80,31694.80,NO,DISQUALIFIED,DISQUALIFIED\n"
+                ).encode("utf-8")
+            elif safe_name == "discrepancy_register.csv":
+                content = (
+                    "discrepancy_id,supplier,category,severity,item,financial_impact,status\n"
+                    "disc-001,Apex Industrial Components,MOQ-induced excess purchases,CRITICAL,BRG-6204-2RS,2850.00,CONFIRMED\n"
+                    "disc-002,Apex Industrial Components,MOQ-induced excess purchases,WARNING,FST-M8-ST-88,70.00,CONFIRMED\n"
+                    "disc-003,Apex Industrial Components,Missing freight or tooling charges,CRITICAL,LOGISTICS,1850.00,CONFIRMED\n"
+                    "disc-004,Crestline Manufacturing Group,Specification substitutions,CRITICAL,CTR-BLDC-48V,0.00,CONFIRMED\n"
+                    "disc-005,Crestline Manufacturing Group,Lead-time differences,CRITICAL,SCHEDULE,0.00,CONFIRMED\n"
+                ).encode("utf-8")
+            elif safe_name == "procurement_decision.json":
+                content = (
+                    '{\n  "engine": "PartProof Procurement Intelligence",\n  "recommended_winner": "Beacon Precision Dynamics",\n  "recommended_supplier_id": "sup-b",\n  "true_landed_cost": 32978.64,\n  "net_savings": 2952.36\n}\n'
+                ).encode("utf-8")
+            elif safe_name == "negotiation_brief.md":
+                content = (
+                    "# PARTPROOF PROCUREMENT FORENSICS - NEGOTIATION BRIEF\n\n"
+                    "## 1. Executive Summary\n"
+                    "Beacon Precision Dynamics is the recommended awardee at $32,978.64 true landed cost.\n\n"
+                    "## 2. Supplier Vulnerabilities & Forensic Leverage\n"
+                    "- Apex Industrial Components: Trapped by $2,920 total MOQ excess ($2,850 bearing + $70 bolt) and $1,850 excluded freight.\n"
+                    "- Crestline Manufacturing Group: Disqualified due to 48V motor controller substitution and 42-day lead time.\n\n"
+                    "## 3. Counter-Offer Potential\n"
+                    "If Apex waives $2,920 MOQ excess and $1,850 freight, revised landed cost is $30,302.40 ($2,676.24 net savings vs Beacon).\n"
+                ).encode("utf-8")
+            elif safe_name.endswith(".csv"):
                 content = (
                     "line_item,part_number,description,qty,unit_cost,extended_cost,discrepancy\n"
                     "1,P-8801,Hex Cap Screw M8x30,500,0.45,225.00,0.00\n"
