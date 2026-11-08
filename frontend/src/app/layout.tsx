@@ -28,9 +28,10 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      data-scroll-behavior="smooth"
+      className={`${geistSans.variable} ${geistMono.variable} min-h-screen antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-[#0B0E12] text-[#F3F5F7]">
+      <body className="min-h-screen flex flex-col bg-[#0B0E12] text-[#F3F5F7]">
         <QueryProvider>
           <LenisProvider>{children}</LenisProvider>
         </QueryProvider>

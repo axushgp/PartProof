@@ -187,3 +187,51 @@ def evaluate_artifacts_rule(plan: TaskPlanSchema, artifact_manager: ArtifactMana
         message=f"All expected artifacts ({len(plan.expected_artifacts)}) passed safety and extension validation.",
         severity="info",
     )
+
+
+def evaluate_input_provenance_rule(plan: TaskPlanSchema) -> RuleResult:
+    """
+    Enforces task input provenance rules.
+    If a task specifies dataset transformation or sanitization, an explicit input file
+    (user-uploaded or explicitly selected synthetic sample) must be attached.
+    """
+    prompt_text = f"{plan.title} {plan.summary} {plan.reasoning_summary}".lower()
+    for s in plan.steps:
+        prompt_text += f" {s.description.lower()} {s.code.lower()}"
+
+    requires_input_dataset = any(
+        kw in prompt_text
+        for kw in [
+            "input dataset",
+            "normalize input",
+            "sanitization rules",
+            "filter out invalid rows",
+            "parse and normalize input",
+            "raw_input.csv",
+        ]
+    )
+
+    provenance = plan.input_provenance
+    mode = provenance.mode if provenance else "prompt_only"
+    file_count = len(provenance.files) if provenance else 0
+
+    if requires_input_dataset and mode == "prompt_only" and file_count == 0:
+        return RuleResult(
+            rule_id="SEC-007",
+            rule_name="InputProvenanceBinding",
+            passed=False,
+            message=(
+                "Input dataset required: The requested operation specifies dataset transformation or "
+                "sanitization, but no input files were attached and no synthetic sample was selected. "
+                "Please attach an input file or explicitly select the Synthetic Sample Dataset."
+            ),
+            severity="error",
+        )
+
+    return RuleResult(
+        rule_id="SEC-007",
+        rule_name="InputProvenanceBinding",
+        passed=True,
+        message=f"Input provenance verified ({mode}, {file_count} file(s) staged under /workspace/input/).",
+        severity="info",
+    )

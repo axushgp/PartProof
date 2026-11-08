@@ -1,7 +1,10 @@
+import base64
 import copy
+import hashlib
+import os
 from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +14,13 @@ from app.api.deps import get_current_user, get_task_planner
 from app.core.config import settings
 from app.database.session import get_db
 from app.models.entities import Approval, Execution, ExecutionEvent, Task, TaskPlan, User
-from app.schemas.plan import PolicyEvaluationResult, TaskPlanSchema
+from app.schemas.plan import PolicyEvaluationResult, TaskInputFileManifest, TaskInputProvenance, TaskPlanSchema
+from app.services.tasks.sample_data import (
+    SYNTHETIC_SAMPLE_DATASET_CSV,
+    SYNTHETIC_SAMPLE_DISCLAIMER,
+    get_synthetic_sample_info,
+    get_synthetic_sample_preview_rows,
+)
 from app.schemas.task import (
     ApprovalRead,
     TaskApproveRequest,
@@ -39,7 +48,10 @@ router = APIRouter()
 def _build_execution_read(execution: Execution) -> ExecutionRead:
     """Safely constructs ExecutionRead without triggering async greenlet lazy-loading."""
     steps = (
-        [ExecutionStepRead.model_validate(s) for s in execution.steps]
+        [
+            ExecutionStepRead.model_validate(s)
+            for s in sorted(execution.steps, key=lambda x: (x.step_number, getattr(x, "attempt_number", 1)))
+        ]
         if "steps" in execution.__dict__ and execution.steps
         else []
     )
@@ -99,6 +111,34 @@ def _build_task_detail(task: Task) -> TaskDetail:
     )
 
 
+@router.get("/sample-dataset")
+async def get_sample_dataset_info():
+    """Returns the synthetic telemetry sample dataset metadata, preview rows, and disclaimer."""
+    fn, raw_bytes, digest, size = get_synthetic_sample_info()
+    return {
+        "filename": fn,
+        "size_bytes": size,
+        "sha256": digest,
+        "disclaimer": SYNTHETIC_SAMPLE_DISCLAIMER,
+        "preview_rows": get_synthetic_sample_preview_rows(),
+        "csv_content": SYNTHETIC_SAMPLE_DATASET_CSV,
+    }
+
+
+@router.get("/sample-dataset/download")
+async def download_sample_dataset_file():
+    """Returns the downloadable raw CSV of the synthetic sample dataset."""
+    fn, raw_bytes, digest, size = get_synthetic_sample_info()
+    return Response(
+        content=raw_bytes,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fn}"',
+            "Content-Length": str(size),
+        },
+    )
+
+
 @router.post("", response_model=TaskDetail, status_code=status.HTTP_201_CREATED)
 async def create_and_plan_task(
     payload: TaskCreate,
@@ -108,7 +148,8 @@ async def create_and_plan_task(
 ):
     """
     Creates a new task and generates an AI execution plan via Vultr Serverless Inference.
-    Does NOT execute any code automatically; transitions task to 'awaiting_approval'.
+    Binds input provenance (prompt_only, user_upload, or synthetic_sample), stages files,
+    and transitions task to 'awaiting_approval'.
     """
     task = Task(
         user_id=current_user.id,
@@ -120,8 +161,73 @@ async def create_and_plan_task(
     await db.commit()
     await db.refresh(task)
 
+    # 1. Resolve and stage task input provenance
+    input_provenance: Optional[TaskInputProvenance] = None
+    input_mode = payload.input_mode or "prompt_only"
+    task_input_dir = os.path.join(settings.ARTIFACT_STORAGE_DIR, "tasks", task.id, "inputs")
+
+    if input_mode == "synthetic_sample":
+        fn, raw_bytes, digest, size = get_synthetic_sample_info()
+        os.makedirs(task_input_dir, exist_ok=True)
+        with open(os.path.join(task_input_dir, fn), "wb") as f:
+            f.write(raw_bytes)
+        input_provenance = TaskInputProvenance(
+            mode="synthetic_sample",
+            files=[
+                TaskInputFileManifest(
+                    filename=fn,
+                    size_bytes=size,
+                    sha256=digest,
+                    detected_format="csv",
+                    storage_path=os.path.join(task_input_dir, fn),
+                    validation_status="valid",
+                )
+            ],
+            disclaimer=SYNTHETIC_SAMPLE_DISCLAIMER,
+        )
+    elif input_mode == "user_upload" and payload.input_files:
+        manifest_files = []
+        os.makedirs(task_input_dir, exist_ok=True)
+        for infile in payload.input_files:
+            safe_name = planner.artifact_manager.sanitize_and_validate_filename(infile.filename)
+            file_bytes = b""
+            if infile.file_content_b64:
+                try:
+                    file_bytes = base64.b64decode(infile.file_content_b64)
+                except Exception:
+                    file_bytes = b""
+            digest = hashlib.sha256(file_bytes).hexdigest() if file_bytes else infile.sha256
+            dest_file = os.path.join(task_input_dir, safe_name)
+            if file_bytes:
+                with open(dest_file, "wb") as f:
+                    f.write(file_bytes)
+            manifest_files.append(
+                TaskInputFileManifest(
+                    filename=safe_name,
+                    size_bytes=len(file_bytes) if file_bytes else infile.size_bytes,
+                    sha256=digest,
+                    detected_format=infile.detected_format or "csv",
+                    storage_path=dest_file if file_bytes else None,
+                    validation_status="valid",
+                )
+            )
+        input_provenance = TaskInputProvenance(
+            mode="user_upload",
+            files=manifest_files,
+            disclaimer=None,
+        )
+    else:
+        input_provenance = TaskInputProvenance(
+            mode="prompt_only",
+            files=[],
+            disclaimer=None,
+        )
+
     try:
-        plan_schema, metadata = await planner.plan_task(payload.description)
+        plan_schema, metadata = await planner.plan_task(
+            payload.description,
+            input_provenance=input_provenance,
+        )
         
         # Apply deterministic policy engine evaluation
         policy_engine = DeterministicPolicyEngine()
@@ -365,7 +471,8 @@ async def get_task_detail(
         .where(Task.id == task_id)
         .options(
             selectinload(Task.plan),
-            selectinload(Task.executions),
+            selectinload(Task.executions).selectinload(Execution.steps),
+            selectinload(Task.executions).selectinload(Execution.artifacts),
             selectinload(Task.approvals),
             selectinload(Task.artifacts),
             selectinload(Task.events),
@@ -400,7 +507,8 @@ async def approve_or_reject_task(
         .with_for_update(of=Task)
         .options(
             selectinload(Task.plan),
-            selectinload(Task.executions),
+            selectinload(Task.executions).selectinload(Execution.steps),
+            selectinload(Task.executions).selectinload(Execution.artifacts),
             selectinload(Task.approvals),
             selectinload(Task.events),
             selectinload(Task.artifacts),
@@ -615,7 +723,8 @@ async def cancel_task(
         .with_for_update(of=Task)
         .options(
             selectinload(Task.plan),
-            selectinload(Task.executions),
+            selectinload(Task.executions).selectinload(Execution.steps),
+            selectinload(Task.executions).selectinload(Execution.artifacts),
             selectinload(Task.approvals),
             selectinload(Task.events),
             selectinload(Task.artifacts),

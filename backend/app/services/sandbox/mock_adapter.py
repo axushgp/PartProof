@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from typing import List, Optional, TYPE_CHECKING
 from app.services.sandbox.base import (
@@ -54,6 +55,16 @@ class MockSandboxAdapter(BaseSandboxAdapter):
         await asyncio.sleep(0.01)
         self._is_created = True
         return self.config.sandbox_id
+
+    async def stage_input_files(self, input_dir: str) -> None:
+        """Records and stages task input files into simulated guest workspace."""
+        self.staged_input_files: List[str] = []
+        if not input_dir or not os.path.exists(input_dir):
+            return
+        for fn in os.listdir(input_dir):
+            src_f = os.path.join(input_dir, fn)
+            if os.path.isfile(src_f):
+                self.staged_input_files.append(fn)
 
     async def execute(self, request: ExecutionRequest) -> ExecutionOutput:
         """
@@ -111,12 +122,17 @@ class MockSandboxAdapter(BaseSandboxAdapter):
             await asyncio.sleep(0.02)
         elapsed = time.monotonic() - start_time
 
+        staged_msg = ""
+        if hasattr(self, "staged_input_files") and self.staged_input_files:
+            staged_msg = f"[MOCK SANDBOX] Mounted input files at /workspace/input/: {', '.join(self.staged_input_files)}\n"
+
         stdout_text = (
             f"[MOCK SANDBOX] Running in deterministic simulated environment (execution_mode=mock)\n"
             f"[MOCK SANDBOX] Sandbox ID: {self.config.sandbox_id}\n"
             f"[MOCK SANDBOX] Guest Kernel: {self.simulated_guest_kernel}\n"
             f"[MOCK SANDBOX] Resource Bounds: {self.config.cpus} vCPU, {self.config.memory_mb} MB RAM\n"
             f"[MOCK SANDBOX] Network: {self.config.network}\n"
+            f"{staged_msg}"
             f"[MOCK SANDBOX] Execution completed with status 0."
         )
 
@@ -184,6 +200,22 @@ class MockSandboxAdapter(BaseSandboxAdapter):
                     "- Crestline Manufacturing Group: Disqualified due to 48V motor controller substitution and 42-day lead time.\n\n"
                     "## 3. Counter-Offer Potential\n"
                     "If Apex waives $2,920 MOQ excess and $1,850 freight, revised landed cost is $30,302.40 ($2,676.24 net savings vs Beacon).\n"
+                ).encode("utf-8")
+            elif safe_name in ("clean_telemetry.csv", "sanitized_telemetry.csv", "clean_output.csv"):
+                content = (
+                    "record_id,timestamp,sensor_id,voltage,temperature_c,status\n"
+                    "REC-001,2026-11-01T08:00:00Z,SNS-101,72.4,45.2,NORMAL\n"
+                    "REC-002,2026-11-01T08:05:00Z,SNS-102,72.1,46.0,NORMAL\n"
+                    "REC-003,2026-11-01T08:10:00Z,SNS-103,71.8,45.8,NORMAL\n"
+                    "REC-005,2026-11-01T08:20:00Z,SNS-102,72.5,46.3,NORMAL\n"
+                    "REC-006,2026-11-01T08:25:00Z,SNS-103,72.0,45.9,NORMAL\n"
+                    "REC-008,2026-11-01T08:35:00Z,SNS-102,72.2,46.1,NORMAL\n"
+                    "REC-009,2026-11-01T08:40:00Z,SNS-103,72.3,46.5,NORMAL\n"
+                    "REC-010,2026-11-01T08:45:00Z,SNS-101,71.7,47.0,NORMAL\n"
+                    "REC-011,2026-11-01T08:50:00Z,SNS-102,72.4,46.2,NORMAL\n"
+                    "REC-013,2026-11-01T09:00:00Z,SNS-101,72.1,46.4,NORMAL\n"
+                    "REC-014,2026-11-01T09:05:00Z,SNS-102,71.9,45.7,NORMAL\n"
+                    "REC-015,2026-11-01T09:10:00Z,SNS-103,72.2,46.0,NORMAL\n"
                 ).encode("utf-8")
             elif safe_name.endswith(".csv"):
                 content = (

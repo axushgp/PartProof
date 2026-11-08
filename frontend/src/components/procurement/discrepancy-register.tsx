@@ -40,7 +40,7 @@ export function DiscrepancyRegister({ discrepancies }: DiscrepancyRegisterProps)
             </span>
           </div>
           <p className="mt-1 text-xs text-slate-400">
-            Automated detection across 14 deterministic procurement audit rules: MOQ inventory traps, unbundled freight, spec substitutions, and pack-size ambiguities.
+            Automated detection across 14 repeatable audit rules: MOQ inventory traps, unbundled freight, spec substitutions, and pack-size ambiguities.
           </p>
         </div>
 

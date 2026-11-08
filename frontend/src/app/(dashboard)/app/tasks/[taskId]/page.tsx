@@ -30,6 +30,8 @@ import { PlanOverview } from "@/components/plans/plan-overview";
 import { PlanSteps } from "@/components/plans/plan-steps";
 import { PolicyInspector } from "@/components/plans/policy-inspector";
 import { PlanIntegrityCard } from "@/components/plans/plan-integrity-card";
+import { InputProvenanceCard } from "@/components/plans/input-provenance-card";
+import { ExecutionProgressTracker } from "@/components/executions/execution-progress-tracker";
 import { ApprovalModal } from "@/components/plans/approval-modal";
 import { RejectModal } from "@/components/plans/reject-modal";
 import { ExecutionTimeline } from "@/components/executions/execution-timeline";
@@ -375,6 +377,14 @@ export default function TaskDetailPage({ params }: TaskDetailPageProps) {
         </div>
       )}
 
+      {/* 8-Phase Execution Progress Tracker & MicroVM Visualization */}
+      <ExecutionProgressTracker
+        task={task}
+        plan={plan}
+        execution={execution}
+        artifacts={artifacts}
+      />
+
       {/* Tabbed View */}
       <Tabs defaultValue="overview" className="w-full">
         <TabsList className="w-full justify-start border-b border-white/8 bg-[#111820]">
@@ -423,6 +433,9 @@ export default function TaskDetailPage({ params }: TaskDetailPageProps) {
             <div className="space-y-6">
               {/* Prominent Plan Integrity Card */}
               <PlanIntegrityCard planHash={plan.plan_hash} />
+
+              {/* Task Input Provenance Card */}
+              <InputProvenanceCard provenance={plan.plan_json.input_provenance} />
 
               <PlanOverview plan={plan} />
 
@@ -488,7 +501,12 @@ export default function TaskDetailPage({ params }: TaskDetailPageProps) {
         {/* Tab 4: Execution Logs */}
         {execution && (
           <TabsContent value="logs" className="space-y-6 pt-2">
-            <StepLogsViewer steps={execution.steps || []} />
+            <StepLogsViewer
+              steps={execution.steps || []}
+              taskStatus={task.status}
+              executionStatus={execution.status}
+              events={events}
+            />
           </TabsContent>
         )}
 

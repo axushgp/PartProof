@@ -18,7 +18,7 @@ test.describe("Procurement Intelligence & Forensics E2E Lifecycle", () => {
     await expect(page.getByRole("heading", { name: "Procurement Intelligence & Forensics" })).toBeVisible();
 
     // Verify honest labeling of the matching engine
-    await expect(page.getByText("Deterministic Part & Policy Engine")).toBeVisible();
+    await expect(page.getByText("Repeatable audit rules")).toBeVisible();
     await expect(page.getByText("MicroSandbox Isolated")).toBeVisible();
 
     // 3. Launch the Synthetic Demonstration Case

@@ -11,6 +11,7 @@ from app.services.policy.rules import (
     evaluate_artifacts_rule,
     evaluate_capabilities_rule,
     evaluate_execution_type_rule,
+    evaluate_input_provenance_rule,
     evaluate_network_mode_rule,
     evaluate_source_size_rule,
     evaluate_step_count_rule,
@@ -43,6 +44,7 @@ class DeterministicPolicyEngine:
             evaluate_capabilities_rule(plan),
             evaluate_source_size_rule(plan),
             evaluate_artifacts_rule(plan, self.artifact_manager),
+            evaluate_input_provenance_rule(plan),
         ]
 
         violations: List[str] = []

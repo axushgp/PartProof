@@ -280,6 +280,33 @@ const server = http.createServer((req, res) => {
       }
 
       // 4. Tasks list & creation
+      if (method === "GET" && path === "/api/v1/tasks/sample-dataset") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            filename: "sample_telemetry_raw.csv",
+            size_bytes: 978,
+            sha256: "a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef1234567890",
+            detected_format: "csv",
+            disclaimer:
+              "Pre-configured 15-record EV powertrain telemetry with intentional defects: REC-004, REC-007, REC-012.",
+            row_count: 15,
+          })
+        );
+        return;
+      }
+
+      if (method === "GET" && path === "/api/v1/tasks/sample-dataset/download") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/csv");
+        res.setHeader("Content-Disposition", 'attachment; filename="sample_telemetry_raw.csv"');
+        res.end(
+          "record_id,timestamp,pack_voltage,current_amps,cell_temp_c,status\nREC-001,2026-11-08T08:00:00Z,398.4,42.1,28.5,NORMAL\n"
+        );
+        return;
+      }
+
       if (method === "GET" && path === "/api/v1/tasks") {
         res.statusCode = 200;
         res.end(JSON.stringify(tasks));
@@ -302,6 +329,9 @@ const server = http.createServer((req, res) => {
 
         tasks.unshift(newTask);
 
+        const inputFiles = parsed.input_files || [];
+        const inputMode = parsed.input_mode || "prompt_only";
+
         plans[newTaskId] = {
           id: `plan-${newTaskId}`,
           task_id: newTaskId,
@@ -315,6 +345,17 @@ const server = http.createServer((req, res) => {
                 execution_type: "subprocess",
               },
             ],
+            input_provenance: {
+              mode: inputMode,
+              files: inputFiles.map((f) => ({
+                filename: f.filename,
+                size_bytes: f.size_bytes || 1024,
+                detected_format: f.detected_format || "data",
+                sha256: f.sha256 || "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              })),
+              manifest_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              disclaimer: inputMode === "synthetic_sample" ? "Synthetic automotive EV telemetry sample dataset staged in /workspace/input/sample_telemetry_raw.csv." : undefined,
+            },
           },
           plan_hash: PLAN_HASH,
           policy_result: {

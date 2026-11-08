@@ -26,6 +26,14 @@ export const registerSchema = z
 
 export type RegisterFormData = z.infer<typeof registerSchema>;
 
+export const taskInputUploadSchema = z.object({
+  filename: z.string().trim(),
+  size_bytes: z.number().int().nonnegative(),
+  detected_format: z.string().trim().optional().nullable(),
+  sha256: z.string().trim().optional().nullable(),
+  file_content_b64: z.string().optional().nullable(),
+});
+
 export const taskCreateSchema = z.object({
   title: z
     .string()
@@ -38,6 +46,10 @@ export const taskCreateSchema = z.object({
     .trim()
     .min(5, "Task description must be at least 5 characters long")
     .max(10000, "Description cannot exceed 10,000 characters"),
+  input_mode: z
+    .enum(["user_upload", "synthetic_sample", "prompt_only"])
+    .optional(),
+  input_files: z.array(taskInputUploadSchema).optional(),
 });
 
 export type TaskCreateFormData = z.infer<typeof taskCreateSchema>;

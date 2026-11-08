@@ -74,6 +74,21 @@ export interface PlanStepSchema {
   expected_output?: string | null;
 }
 
+export interface TaskInputFileManifest {
+  filename: string;
+  size_bytes: number;
+  sha256: string;
+  detected_format?: string | null;
+  storage_path?: string | null;
+  validation_status?: string | null;
+}
+
+export interface TaskInputProvenance {
+  mode: "user_upload" | "synthetic_sample" | "prompt_only" | string;
+  files: TaskInputFileManifest[];
+  disclaimer?: string | null;
+}
+
 export interface TaskPlanSchema {
   title: string;
   summary: string;
@@ -83,6 +98,7 @@ export interface TaskPlanSchema {
   network_required: boolean;
   success_criteria: string[];
   expected_artifacts: string[];
+  input_provenance?: TaskInputProvenance | null;
 }
 
 export interface PolicyEvaluationResult {
@@ -142,6 +158,7 @@ export interface ExecutionStepRead {
   task_id?: string;
   execution_id?: string;
   step_number: number;
+  attempt_number?: number;
   description: string;
   execution_type: string;
   code?: string | null;
@@ -247,9 +264,19 @@ export interface TaskDetail {
   events: ExecutionEventRead[];
 }
 
+export interface TaskInputUpload {
+  filename: string;
+  size_bytes: number;
+  detected_format?: string | null;
+  sha256?: string | null;
+  file_content_b64?: string | null;
+}
+
 export interface TaskCreate {
   title?: string | null;
   description: string;
+  input_mode?: "user_upload" | "synthetic_sample" | "prompt_only";
+  input_files?: TaskInputUpload[];
 }
 
 export interface TaskApproveRequest {

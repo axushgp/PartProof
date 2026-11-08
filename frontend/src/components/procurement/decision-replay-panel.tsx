@@ -56,11 +56,13 @@ export function DecisionReplayPanel({ auditPayload, onReplayUpdate }: DecisionRe
     setBearingMoqApex(200);
     setWaiveFreightApex(true);
     setDiscountApex(0);
+    setDeadlineDays(auditPayload.delivery_deadline_days || 30);
     await executeReplay({
-      moqOverrides: { "BRG-6204-2RS": 200, "FST-M8-ST-88": 800 },
+      moqOverrides: { "sup-a:BRG-6204-2RS": 200, "sup-a:FST-M8-ST-88": 800 },
       waiveFreight: true,
       discount: 0,
       itemDiscounts: {},
+      deadline: auditPayload.delivery_deadline_days || 30,
     });
   };
 
@@ -69,18 +71,29 @@ export function DecisionReplayPanel({ auditPayload, onReplayUpdate }: DecisionRe
     setBearingMoqApex(500);
     setWaiveFreightApex(false);
     setDiscountApex(0);
+    setDeadlineDays(auditPayload.delivery_deadline_days || 30);
     await executeReplay({
       moqOverrides: {},
       waiveFreight: false,
       discount: 0,
-      itemDiscounts: { "CTR-BLDC-72V": 8.0 },
+      itemDiscounts: { "sup-a:CTR-BLDC-72V": 8.0 },
+      deadline: auditPayload.delivery_deadline_days || 30,
     });
   };
 
   const applyPreset3 = async () => {
     // What if project delivery deadline is extended to 45 days?
+    setBearingMoqApex(500);
+    setWaiveFreightApex(false);
+    setDiscountApex(0);
     setDeadlineDays(45);
-    await executeReplay({ deadline: 45 });
+    await executeReplay({
+      moqOverrides: {},
+      waiveFreight: false,
+      discount: 0,
+      itemDiscounts: {},
+      deadline: 45,
+    });
   };
 
   const resetToBaseline = async () => {
@@ -106,7 +119,7 @@ export function DecisionReplayPanel({ auditPayload, onReplayUpdate }: DecisionRe
             <Sliders className="h-5 w-5 text-teal-400" />
             <h3 className="text-base font-semibold text-slate-100">Procurement Decision Replay (What-If Simulation)</h3>
             <span className="rounded-full bg-teal-500/20 px-2.5 py-0.5 text-xs font-mono font-medium text-teal-300">
-              Deterministic Recalculation
+              Consistent landed-cost calculations
             </span>
           </div>
           <p className="mt-1 text-xs text-slate-400">
@@ -292,6 +305,48 @@ export function DecisionReplayPanel({ auditPayload, onReplayUpdate }: DecisionRe
               </ol>
             </div>
           </div>
+
+          {/* Individual Supplier Revised Costs */}
+          {replayResult.suppliers && replayResult.suppliers.length > 0 && (
+            <div className="mt-4 pt-3 border-t border-teal-500/20">
+              <span className="text-slate-400 font-mono text-[11px] block mb-2">
+                Revised Supplier Landed Disbursements:
+              </span>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                {replayResult.suppliers.map((sup) => {
+                  const isWinner = sup.supplier_id === replayResult.new_recommended_supplier_id;
+                  return (
+                    <div
+                      key={sup.supplier_id}
+                      className={`p-3 rounded-lg border font-mono transition ${
+                        isWinner
+                          ? "border-teal-500/60 bg-teal-950/50 shadow-sm"
+                          : "border-slate-800 bg-slate-900/60"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 truncate">
+                        <span className="truncate">{sup.supplier_name}</span>
+                        {isWinner && (
+                          <span className="text-[10px] text-teal-300 uppercase font-semibold">
+                            Winner
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-base font-bold text-slate-100 mt-1">
+                        ${Number(sup.true_landed_cost).toLocaleString("en-US", {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5 uppercase">
+                        Status: <span className={sup.is_compliant ? "text-emerald-400" : "text-rose-400"}>{sup.compliance_status}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

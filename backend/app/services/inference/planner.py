@@ -3,7 +3,7 @@ import logging
 import re
 from typing import Optional, Tuple
 from app.core.config import settings
-from app.schemas.plan import TaskPlanSchema
+from app.schemas.plan import TaskInputProvenance, TaskPlanSchema
 from app.services.artifacts.manager import ArtifactManager
 from app.services.inference.base import InferenceMetadata
 from app.services.inference.exceptions import PlanValidationError, TaskPlanningError
@@ -103,6 +103,7 @@ class TaskPlanner:
         self,
         task_description: str,
         model: Optional[str] = None,
+        input_provenance: Optional[TaskInputProvenance] = None,
     ) -> Tuple[TaskPlanSchema, InferenceMetadata]:
         """
         Coordinates full planning flow: prompt preparation, inference, parsing, and validation.
@@ -110,7 +111,8 @@ class TaskPlanner:
         if not task_description or not task_description.strip():
             raise TaskPlanningError("Task description cannot be empty.")
 
-        messages = build_planning_messages(task_description)
+        input_files = [f.filename for f in input_provenance.files] if input_provenance and input_provenance.files else None
+        messages = build_planning_messages(task_description, input_files=input_files)
 
         try:
             inference_resp = await self.client.chat_completion(
@@ -137,7 +139,11 @@ class TaskPlanner:
 
         # Validate against Pydantic TaskPlanSchema
         try:
+            if input_provenance and "input_provenance" not in parsed_data:
+                parsed_data["input_provenance"] = input_provenance.model_dump(mode="json")
             plan = TaskPlanSchema.model_validate(parsed_data)
+            if input_provenance and not plan.input_provenance:
+                plan.input_provenance = input_provenance
         except Exception as e:
             logger.error(f"JSON failed TaskPlanSchema validation: {e}")
             raise PlanValidationError(

@@ -25,10 +25,10 @@ export function PolicyInspector({ policy }: PolicyInspectorProps) {
           <div>
             <CardTitle className="text-base font-semibold text-white flex items-center gap-2">
               <ShieldCheck className="h-4 w-4 text-[#55D6C2]" />
-              Deterministic Policy Engine Inspector
+              Rules-Based Policy Engine Inspector
             </CardTitle>
             <CardDescription className="text-xs text-zinc-400">
-              Deterministic verification against platform blast-radius constraints
+              Policy-checked verification against platform blast-radius constraints
             </CardDescription>
           </div>
 

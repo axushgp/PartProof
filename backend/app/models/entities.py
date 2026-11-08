@@ -144,7 +144,7 @@ class ExecutionStep(Base):
     execution_id: Mapped[str] = mapped_column(String(36), ForeignKey("executions.id", ondelete="CASCADE"), nullable=False, index=True)
     step_number: Mapped[int] = mapped_column(Integer, nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, default=1)
-    description: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
     execution_type: Mapped[str] = mapped_column(String(50), default="python")
     code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="pending")

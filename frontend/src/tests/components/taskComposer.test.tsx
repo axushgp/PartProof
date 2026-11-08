@@ -98,10 +98,12 @@ describe("CreateTaskPage Component", () => {
     await user.click(submitBtn);
 
     await waitFor(() => {
-      expect(api.tasks.create).toHaveBeenCalledWith({
-        title: null,
-        description: "Verify isolated guest execution environment.",
-      });
+      expect(api.tasks.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: null,
+          description: "Verify isolated guest execution environment.",
+        })
+      );
       expect(mockPush).toHaveBeenCalledWith("/app/tasks/task-test-456");
     });
   });

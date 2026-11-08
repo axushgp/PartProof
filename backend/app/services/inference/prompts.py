@@ -35,9 +35,23 @@ You must respond with ONLY a valid, parseable JSON object matching this exact sc
 Do not include any conversational filler, markdown greetings, or text outside the JSON object.
 """
 
-def build_planning_messages(task_description: str) -> list[dict[str, str]]:
+from typing import List, Optional
+
+
+def build_planning_messages(task_description: str, input_files: Optional[List[str]] = None) -> list[dict[str, str]]:
     """Constructs prompt messages for Vultr Serverless Inference planning."""
+    user_content = f"Task Description:\n{task_description.strip()}"
+    if input_files:
+        user_content += (
+            "\n\nSTAGED INPUT FILES (available under /workspace/input/):\n"
+            + "\n".join(f"- /workspace/input/{f}" for f in input_files)
+            + "\n\nCRITICAL DATA PIPELINE REQUIREMENT: Your generated Python code MUST read directly "
+            "from the input file(s) under /workspace/input/ and write all output files to /workspace/output/. "
+            "DO NOT create mock data, inline fake data, or generate synthetic replacement files inside the script. "
+            "Process the actual staged input files."
+        )
+
     return [
         {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Task Description:\n{task_description.strip()}"},
+        {"role": "user", "content": user_content},
     ]

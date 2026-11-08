@@ -57,10 +57,14 @@ def replay_procurement_decision(
 
         # Item-specific discount check
         for q in quotes:
-            item_disc = req.item_discounts_pct.get(q.part_number) or req.item_discounts_pct.get(f"{sup_id}:{q.part_number}")
-            if item_disc:
+            item_disc = None
+            if req.item_discounts_pct:
+                item_disc = req.item_discounts_pct.get(f"{sup_id}:{q.part_number}")
+                if item_disc is None:
+                    item_disc = req.item_discounts_pct.get(q.part_number)
+            if item_disc is not None:
                 scenario_notes.append(f"{q.part_number} for {quotes[0].supplier_name} discounted by {item_disc}%.")
-                factor = Decimal(str(round(1.0 - (item_disc / 100.0), 4)))
+                factor = Decimal(str(round(1.0 - (float(item_disc) / 100.0), 4)))
                 q.unit_price = _quantize(q.unit_price * factor)
 
         # Freight waiver check
@@ -72,12 +76,12 @@ def replay_procurement_decision(
 
         # MOQ override check
         for q in quotes:
-            if q.part_number in req.moq_overrides:
-                new_moq = Decimal(str(req.moq_overrides[q.part_number]))
+            if f"{sup_id}:{q.part_number}" in req.moq_overrides:
+                new_moq = Decimal(str(req.moq_overrides[f"{sup_id}:{q.part_number}"]))
                 scenario_notes.append(f"MOQ on {q.part_number} for {q.supplier_name} changed to {new_moq}.")
                 q.moq = new_moq
-            elif f"{sup_id}:{q.part_number}" in req.moq_overrides:
-                new_moq = Decimal(str(req.moq_overrides[f"{sup_id}:{q.part_number}"]))
+            elif q.part_number in req.moq_overrides:
+                new_moq = Decimal(str(req.moq_overrides[q.part_number]))
                 scenario_notes.append(f"MOQ on {q.part_number} for {q.supplier_name} changed to {new_moq}.")
                 q.moq = new_moq
 

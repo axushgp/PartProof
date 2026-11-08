@@ -1,12 +1,19 @@
 from datetime import datetime
 from typing import List, Optional, Any
 from pydantic import BaseModel, Field, ConfigDict
-from app.schemas.plan import TaskPlanSchema, PolicyEvaluationResult
+from app.schemas.plan import (
+    PolicyEvaluationResult,
+    TaskInputFileManifest,
+    TaskInputProvenance,
+    TaskPlanSchema,
+)
 
 
 class TaskCreate(BaseModel):
     title: Optional[str] = Field(default=None, description="Optional title; if omitted, the planner assigns one")
     description: str = Field(min_length=5, description="Natural language task or engineering audit objective")
+    input_mode: str = Field(default="prompt_only", description="'prompt_only', 'user_upload', or 'synthetic_sample'")
+    input_files: List[TaskInputFileManifest] = Field(default_factory=list, description="Attached or selected input file manifest")
 
 
 class TaskPlanRead(BaseModel):

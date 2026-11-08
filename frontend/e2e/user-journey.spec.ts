@@ -44,7 +44,7 @@ test.describe("Full PartProof User Journey", () => {
 
     // 8. Inspect Policy Tab
     await page.getByRole("tab", { name: /Policy Engine/i }).click();
-    await expect(page.getByText("Deterministic Policy Engine Inspector")).toBeVisible();
+    await expect(page.getByText("Rules-Based Policy Engine Inspector")).toBeVisible();
     await expect(page.getByText("ALLOWED")).toBeVisible();
 
     // 9. Inspect Steps Tab
@@ -74,14 +74,10 @@ test.describe("Full PartProof User Journey", () => {
     await expect(page.getByText("guest-microsandbox-prod-42").first()).toBeVisible();
     await expect(page.getByText("7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069")).toBeVisible();
 
-    // 14. Check Artifacts Table and verify pending download capability note
-    await expect(page.getByText("verification-report.json")).toBeVisible();
-    await expect(page.getByText("Artifact Download Note:")).toBeVisible();
-    await expect(page.getByText(/pending backend capability/i)).toBeVisible();
-
-    // Ensure no broken 404 download links
-    const downloadLinks = await page.locator('a[href*="/download"]').count();
-    expect(downloadLinks).toBe(0);
+    // 14. Check Artifacts Table and verify authenticated download capability
+    await expect(page.getByText("verification-report.json").first()).toBeVisible();
+    await expect(page.getByText("Authenticated Artifact Downloads:")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Download" }).first()).toBeVisible();
 
     // 15. Sign out
     await page.getByRole("button", { name: /auditor@partproof\.io/i }).click({ force: true });

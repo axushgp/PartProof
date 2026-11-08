@@ -35,6 +35,9 @@ export default function ProcurementPage() {
   const handleLoadDemo = async () => {
     setIsLoading(true);
     setErrorMsg(null);
+    setAuditPayload(null);
+    setComparisonResult(null);
+    setExtractedDocs([]);
     try {
       const demo = await fetchProcurementDemo();
       setAuditPayload(demo);
@@ -57,6 +60,9 @@ export default function ProcurementPage() {
   ) => {
     setIsLoading(true);
     setErrorMsg(null);
+    setAuditPayload(null);
+    setComparisonResult(null);
+    setExtractedDocs([]);
     try {
       const docs = await extractDocuments(bomFile, quoteFiles, supplierNames);
       setExtractedDocs(docs);
@@ -104,6 +110,12 @@ export default function ProcurementPage() {
         }));
       }
 
+      const totalQuoteItems = Object.values(supplierQuotes).reduce((sum, q) => sum + q.length, 0);
+      if (bomItems.length === 0 && totalQuoteItems === 0) {
+        setErrorMsg("No valid procurement line items could be extracted. Please check file formatting or upload standard CSV/XLSX spreadsheets.");
+        return;
+      }
+
       const payload: ProcurementAuditPayload = {
         title: bomFile ? bomFile.name.replace(/\.[^/.]+$/, "") : "Custom Engineering Procurement Audit",
         budget_limit: 42000,
@@ -146,13 +158,13 @@ export default function ProcurementPage() {
               Procurement Intelligence & Forensics
             </h1>
             <p className="mt-1 text-sm text-slate-400 max-w-3xl">
-              Deterministic investigation of engineering BOMs and supplier quotations. Detects hidden procurement costs, pack-size traps, unquoted freight, and evaluates true landed costs under isolated MicroVM governance.
+              Rules-based procurement analysis of engineering BOMs and supplier quotations. Detects hidden procurement costs, pack-size traps, unquoted freight, and evaluates consistent landed-cost calculations under isolated MicroVM governance.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <span className="rounded-full border border-teal-500/30 bg-teal-950/40 px-3 py-1 text-xs font-mono text-teal-300">
-              Deterministic Part & Policy Engine
+              Repeatable audit rules
             </span>
             <span className="rounded-full border border-emerald-500/30 bg-emerald-950/40 px-3 py-1 text-xs font-mono text-emerald-300">
               MicroSandbox Isolated

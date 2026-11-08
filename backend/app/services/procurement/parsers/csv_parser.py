@@ -41,12 +41,12 @@ def _normalize_header(header: str) -> str:
         return "part_number"
     if any(k in h for k in ["description", "desc", "specification", "spec", "item_name", "title"]):
         return "description"
+    if any(k in h for k in ["unit_price", "price", "rate", "unit_cost", "cost", "target_price"]):
+        return "unit_price"
     if any(k in h for k in ["qty", "quantity", "req_qty", "units"]):
         return "qty"
-    if any(k in h for k in ["uom", "unit_of_measure", "unit"]):
+    if any(k in h for k in ["uom", "unit_of_measure"]) or h == "unit":
         return "uom"
-    if any(k in h for k in ["unit_price", "price", "rate", "unit_cost", "cost"]):
-        return "unit_price"
     if any(k in h for k in ["pack_size", "pack", "package_size", "box_qty"]):
         return "pack_size"
     if any(k in h for k in ["moq", "min_order", "minimum_order"]):

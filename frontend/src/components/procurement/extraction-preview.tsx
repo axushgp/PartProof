@@ -60,7 +60,7 @@ export function ExtractionPreview({
           <div>
             <p className="font-semibold">OCR Required Warning:</p>
             <p className="mt-0.5 text-amber-200/90">
-              One or more uploaded documents appear to be image-based or scanned PDFs without extractable text. Please upload digital text PDFs, CSV, or XLSX spreadsheets for deterministic audit validation.
+              One or more uploaded documents appear to be image-based or scanned PDFs without extractable text. Please upload digital text PDFs, CSV, or XLSX spreadsheets for repeatable audit rules and landed-cost verification.
             </p>
           </div>
         </div>

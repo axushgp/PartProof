@@ -61,7 +61,7 @@ export function PlanIntegrityCard({ planHash }: PlanIntegrityCardProps) {
         </div>
 
         <p className="text-[11px] text-zinc-400 leading-relaxed">
-          This 64-character SHA-256 digest deterministically hashes the plan title, steps, code, and policy constraints. When you approve, this exact hash is cryptographically bound to the execution record and re-verified before guest microVM launch.
+          This 64-character SHA-256 digest cryptographically binds the plan title, steps, code, and policy constraints. When you approve, this exact hash is cryptographically bound to the execution record and re-verified before guest microVM launch.
         </p>
       </CardContent>
     </Card>

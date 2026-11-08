@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import os
 from typing import Any, Dict, List, Optional
 from app.core.config import settings
 from app.models.entities import Approval, Execution
@@ -137,6 +139,31 @@ class SecurityExecutionValidator:
             except Exception as e:
                 violations.append(f"Step {s.step_id or idx} code violates safety bounds: {e}")
 
+        # 13. Input file integrity & provenance validation
+        if plan_schema.input_provenance and plan_schema.input_provenance.files:
+            import hashlib
+            task_input_dir = os.path.join(settings.ARTIFACT_STORAGE_DIR, "tasks", execution.task_id, "inputs")
+            for in_file in plan_schema.input_provenance.files:
+                target_path = os.path.join(task_input_dir, in_file.filename)
+                if not os.path.isfile(target_path):
+                    violations.append(
+                        f"Approved input file '{in_file.filename}' is missing from staging at {target_path}."
+                    )
+                    continue
+                try:
+                    with open(target_path, "rb") as f:
+                        file_bytes = f.read()
+                    actual_digest = hashlib.sha256(file_bytes).hexdigest()
+                    if in_file.sha256 and actual_digest != in_file.sha256:
+                        violations.append(
+                            f"Approved input file '{in_file.filename}' was modified after approval: "
+                            f"expected SHA-256 '{in_file.sha256}', found '{actual_digest}'."
+                        )
+                except Exception as read_err:
+                    violations.append(
+                        f"Failed reading approved input file '{in_file.filename}': {read_err}"
+                    )
+
         if violations:
             logger.warning(
                 "Security validation failed for execution %s with %d violations: %s",
@@ -146,5 +173,5 @@ class SecurityExecutionValidator:
             )
             raise SecurityValidationError("Security execution validation failed.", violations)
 
-        logger.info("Security validation passed all 12 checks for execution %s", execution.id)
+        logger.info("Security validation passed all 13 checks for execution %s", execution.id)
         return plan_schema

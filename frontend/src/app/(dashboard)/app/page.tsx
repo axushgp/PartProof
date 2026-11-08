@@ -402,7 +402,7 @@ export default function OverviewPage() {
                   </div>
                   <div className="flex items-center justify-between py-1">
                     <span className="text-zinc-400">Teardown Verification</span>
-                    <span className="font-mono text-emerald-400 font-medium">Deterministic Strict</span>
+                    <span className="font-mono text-emerald-400 font-medium">Policy-checked Strict</span>
                   </div>
                 </div>
               </div>

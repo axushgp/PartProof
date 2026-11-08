@@ -28,7 +28,7 @@ export function ExecutionTimeline({ taskStatus, events }: ExecutionTimelineProps
               Execution Lifecycle Timeline
             </CardTitle>
             <CardDescription className="text-xs text-zinc-400">
-              Audit trail of deterministic state transitions and microVM events
+              Audit trail of policy-checked state transitions and microVM events
             </CardDescription>
           </div>
           <div className="flex items-center gap-2">

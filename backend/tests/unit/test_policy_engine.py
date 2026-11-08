@@ -43,7 +43,7 @@ def test_valid_offline_plan_passes_policy(policy_engine: DeterministicPolicyEngi
     assert result.approval_required is True
     assert result.plan_hash is not None
     assert len(result.plan_hash) == 64
-    assert len(result.rule_results) == 6
+    assert len(result.rule_results) == 7
     assert all(r["passed"] for r in result.rule_results)
 
 

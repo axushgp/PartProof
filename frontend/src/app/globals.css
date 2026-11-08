@@ -42,6 +42,8 @@
 
 html {
   color-scheme: dark;
+  scroll-behavior: smooth;
+  overflow-y: auto;
 }
 
 body {

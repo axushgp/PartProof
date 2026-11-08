@@ -13,6 +13,26 @@ class PlanStepSchema(BaseModel):
     expected_output: Optional[str] = Field(default=None, description="Expected console output or artifact")
 
 
+class TaskInputFileManifest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    filename: str
+    size_bytes: int
+    sha256: str
+    detected_format: str = "csv"
+    storage_path: Optional[str] = None
+    validation_status: str = "valid"
+    file_content_b64: Optional[str] = None
+
+
+class TaskInputProvenance(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    mode: str = "prompt_only"  # prompt_only, user_upload, synthetic_sample
+    files: List[TaskInputFileManifest] = []
+    disclaimer: Optional[str] = None
+
+
 class TaskPlanSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -24,6 +44,7 @@ class TaskPlanSchema(BaseModel):
     network_required: bool = Field(default=False, description="Whether network access is requested (Default: False)")
     success_criteria: List[str] = Field(default_factory=list, description="Measurable conditions for task success")
     expected_artifacts: List[str] = Field(default_factory=list, description="Filenames expected to be generated, e.g. ['report.csv']")
+    input_provenance: Optional[TaskInputProvenance] = Field(default=None, description="Explicit input provenance and file manifest")
 
 
 class PolicyEvaluationResult(BaseModel):

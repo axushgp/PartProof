@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -327,6 +328,11 @@ class SandboxManager:
                     try:
                         await asyncio.wait_for(adapter.create(), timeout=prov_remaining)
                         guest_kernel = getattr(adapter, "_guest_kernel", None)
+
+                        # Stage real task input files into /workspace/input/ inside sandbox
+                        task_input_dir = os.path.join(settings.ARTIFACT_STORAGE_DIR, "tasks", task_id, "inputs")
+                        if os.path.isdir(task_input_dir):
+                            await adapter.stage_input_files(task_input_dir)
                     except asyncio.TimeoutError:
                         logger.warning(
                             f"MicroVM provisioning timed out after remaining budget of {prov_remaining:.2f}s"

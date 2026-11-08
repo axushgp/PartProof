@@ -157,6 +157,7 @@ class ExecutionWorker:
         logger.info("Beginning processing for execution %s (task %s)", execution_id, task_id)
 
         # 1. Fetch execution and approval for pre-execution validation
+        self._step_persistence_failed = False
         plan_schema = None
         sandbox_id = self.sandbox_manager.generate_sandbox_id(task_id, execution_id)
         now = datetime.now(timezone.utc)
@@ -369,73 +370,105 @@ class ExecutionWorker:
         Persists each step output immediately into PostgreSQL upon step completion.
         Enforces worker ID, active execution status ('running'), and unexpired lease.
         A worker that loses its lease must not persist steps, events, or artifacts.
+        Retries transient DB errors with backoff. If persistence ultimately fails,
+        surfaces a critical audit failure and marks execution as failed.
         """
-        async with self.session_factory() as session:
-            now = datetime.now(timezone.utc)
-            dialect_name = session.bind.dialect.name if session.bind else "postgresql"
-            is_postgres = "postgres" in dialect_name
+        max_attempts = 3
+        last_error = None
 
-            # Row lock / conditional verification of ownership, active running status, and valid lease
-            stmt = (
-                select(Execution)
-                .where(
-                    Execution.id == execution_id,
-                    Execution.worker_id == self.worker_id,
-                    Execution.status == "running",
-                    Execution.lease_expires_at > now,
-                )
-            )
-            if is_postgres:
-                stmt = stmt.with_for_update(of=Execution)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self.session_factory() as session:
+                    now = datetime.now(timezone.utc)
+                    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+                    is_postgres = "postgres" in dialect_name
 
-            res = await session.execute(stmt)
-            exec_rec = res.scalar_one_or_none()
+                    # Row lock / conditional verification of ownership, active running status, and valid lease
+                    stmt = (
+                        select(Execution)
+                        .where(
+                            Execution.id == execution_id,
+                            Execution.worker_id == self.worker_id,
+                            Execution.status == "running",
+                            Execution.lease_expires_at > now,
+                        )
+                    )
+                    if is_postgres:
+                        stmt = stmt.with_for_update(of=Execution)
 
-            if not exec_rec:
+                    res = await session.execute(stmt)
+                    exec_rec = res.scalar_one_or_none()
+
+                    if not exec_rec:
+                        logger.warning(
+                            "Worker %s lost ownership, active status, or unexpired lease for execution %s during step %d output persistence. Mutation aborted.",
+                            self.worker_id,
+                            execution_id,
+                            output.step_number,
+                        )
+                        self._execution_cancelled = True
+                        raise RuntimeError(
+                            f"Worker {self.worker_id} lost ownership, active status, or lease for execution {execution_id} before persisting step {output.step_number}"
+                        )
+
+                    step_record = ExecutionStep(
+                        execution_id=execution_id,
+                        step_number=output.step_number,
+                        attempt_number=attempt_number,
+                        description=output.description or f"Step {output.step_number}",
+                        execution_type=output.execution_type or "python",
+                        code=output.code,
+                        status=output.status,
+                        stdout=output.stdout,
+                        stderr=output.stderr,
+                        exit_code=output.exit_code,
+                        started_at=output.started_at,
+                        completed_at=output.completed_at,
+                    )
+                    session.add(step_record)
+                    session.add(
+                        ExecutionEvent(
+                            task_id=task_id,
+                            execution_id=execution_id,
+                            event_type="execution_step_completed" if output.status != "skipped" else "execution_step_skipped",
+                            message=(
+                                f"Step {output.step_number} ('{step_record.description}') finished with "
+                                f"status '{output.status}' (exit_code={output.exit_code})."
+                            ),
+                            metadata_json={
+                                "step_number": output.step_number,
+                                "status": output.status,
+                                "exit_code": output.exit_code,
+                                "duration_seconds": output.duration_seconds,
+                            },
+                        )
+                    )
+                    await session.commit()
+                    return
+            except Exception as e:
+                last_error = e
                 logger.warning(
-                    "Worker %s lost ownership, active status, or unexpired lease for execution %s during step %d output persistence. Mutation aborted.",
-                    self.worker_id,
+                    "Persistence attempt %d/%d for execution %s step %d failed: %s",
+                    attempt,
+                    max_attempts,
                     execution_id,
                     output.step_number,
+                    e,
                 )
-                self._execution_cancelled = True
-                raise RuntimeError(
-                    f"Worker {self.worker_id} lost ownership, active status, or lease for execution {execution_id} before persisting step {output.step_number}"
-                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.2 * (2 ** (attempt - 1)))
 
-            step_record = ExecutionStep(
-                execution_id=execution_id,
-                step_number=output.step_number,
-                attempt_number=attempt_number,
-                description=output.description or f"Step {output.step_number}",
-                execution_type=output.execution_type or "python",
-                code=output.code,
-                status=output.status,
-                stdout=output.stdout,
-                stderr=output.stderr,
-                exit_code=output.exit_code,
-                started_at=output.started_at,
-                completed_at=output.completed_at,
-            )
-            session.add(step_record)
-            session.add(
-                ExecutionEvent(
-                    task_id=task_id,
-                    execution_id=execution_id,
-                    event_type="execution_step_completed" if output.status != "skipped" else "execution_step_skipped",
-                    message=(
-                        f"Step {output.step_number} ('{step_record.description}') finished with "
-                        f"status '{output.status}' (exit_code={output.exit_code})."
-                    ),
-                    metadata_json={
-                        "step_number": output.step_number,
-                        "status": output.status,
-                        "exit_code": output.exit_code,
-                        "duration_seconds": output.duration_seconds,
-                    },
-                )
-            )
-            await session.commit()
+        self._step_persistence_failed = True
+        logger.error(
+            "CRITICAL AUDIT FAILURE: Failed to persist execution step %d for %s after %d attempts: %s",
+            output.step_number,
+            execution_id,
+            max_attempts,
+            last_error,
+        )
+        raise RuntimeError(
+            f"Step persistence failed for execution {execution_id} step {output.step_number}: {last_error}"
+        )
 
     async def _finalize_execution(
         self,
@@ -483,6 +516,13 @@ class ExecutionWorker:
                 final_cleanup_status = "verified_destroyed"
                 event_type = "execution_cancelled"
                 event_msg = "Execution cancelled."
+            elif getattr(self, "_step_persistence_failed", False):
+                # Critical audit invariant: if step records could not be saved, never report successful execution
+                target_status = "failed"
+                task_status = "failed"
+                final_cleanup_status = "verified_destroyed"
+                event_type = "execution_failed"
+                event_msg = "Execution failed: Audit persistence failure prevented saving execution step records."
             elif result.status == "succeeded":
                 target_status = "succeeded"
                 task_status = "succeeded"

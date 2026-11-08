@@ -117,6 +117,28 @@ class MicrosandboxAdapter(BaseSandboxAdapter):
                 execution_id=self.config.execution_id,
             ) from e
 
+    async def stage_input_files(self, input_dir: str) -> None:
+        """Transfers input files from host task input storage into /workspace/input/ inside microVM."""
+        if not input_dir or not os.path.exists(input_dir) or not self._sandbox:
+            return
+        await self._sandbox.exec("mkdir", ["-p", "/workspace/input"], timeout=5.0)
+        for fn in os.listdir(input_dir):
+            src_path = os.path.join(input_dir, fn)
+            if not os.path.isfile(src_path):
+                continue
+            safe_fn = self.artifact_manager.sanitize_and_validate_filename(fn)
+            guest_input_path = f"/workspace/input/{safe_fn}"
+            with open(src_path, "rb") as f:
+                content = f.read()
+            if hasattr(self._sandbox, "fs") and hasattr(self._sandbox.fs, "write"):
+                await self._sandbox.fs.write(guest_input_path, content)
+            else:
+                write_py = (
+                    f"with open('{guest_input_path}', 'wb') as f:\n"
+                    f"    f.write({repr(content)})\n"
+                )
+                await self._sandbox.exec("python3", ["-c", write_py], timeout=10.0)
+
     async def execute(self, request: ExecutionRequest) -> ExecutionOutput:
         """
         Transfers source code into guest workspace and executes it inside the microVM.

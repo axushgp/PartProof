@@ -183,6 +183,13 @@ class BaseSandboxAdapter(ABC):
         """
         pass
 
+    async def stage_input_files(self, input_dir: str) -> None:
+        """
+        Transfers staged input files from host task input storage into /workspace/input/
+        inside the isolated sandbox before guest step execution.
+        """
+        pass
+
     @abstractmethod
     async def execute(self, request: ExecutionRequest) -> ExecutionOutput:
         """

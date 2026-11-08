@@ -9,15 +9,16 @@ class ExecutionStepRead(BaseModel):
 
     id: str
     step_number: int
+    attempt_number: int = 1
     description: str
     execution_type: str
-    code: Optional[str]
+    code: Optional[str] = None
     status: str
-    stdout: Optional[str]
-    stderr: Optional[str]
-    exit_code: Optional[int]
-    started_at: Optional[datetime]
-    completed_at: Optional[datetime]
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
+    exit_code: Optional[int] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
 
 
 class ArtifactRead(BaseModel):
