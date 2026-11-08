@@ -43,6 +43,7 @@ describe("LoginPage Component", () => {
     expect(screen.getByLabelText(/^Password/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Sign in to Console/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /autofill/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Create Auditor Account/i })).toHaveAttribute("href", "/signup");
   });
 
   it("allows user to type credentials directly and toggles password visibility", async () => {

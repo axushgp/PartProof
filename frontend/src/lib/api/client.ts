@@ -2,6 +2,7 @@ import {
   HealthResponse,
   LoginRequest,
   ProviderHealth,
+  RegisterRequest,
   SystemStatus,
   TaskApproveRequest,
   TaskCancelRequest,
@@ -55,6 +56,12 @@ export const api = {
   auth: {
     login: async (credentials: LoginRequest): Promise<{ user_id: string; email: string; role: string }> => {
       return fetchJson("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify(credentials),
+      });
+    },
+    register: async (credentials: RegisterRequest): Promise<{ user_id: string; email: string; role: string }> => {
+      return fetchJson("/api/auth/register", {
         method: "POST",
         body: JSON.stringify(credentials),
       });

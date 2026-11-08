@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   loginSchema,
+  registerSchema,
   taskCreateSchema,
   approvalSchema,
   cancelSchema,
@@ -138,6 +139,74 @@ describe("Validation Schemas", () => {
       if (!result.success) {
         expect(result.error.issues[0].message).toContain("cannot exceed 500");
       }
+    });
+  });
+
+  describe("registerSchema", () => {
+    it("accepts valid email, password >= 12 chars, and matching confirmPassword", () => {
+      const result = registerSchema.safeParse({
+        email: "newauditor@partproof.io",
+        password: "PartProofSecure2026!",
+        confirmPassword: "PartProofSecure2026!",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects password shorter than 12 characters", () => {
+      const result = registerSchema.safeParse({
+        email: "newauditor@partproof.io",
+        password: "Short123!",
+        confirmPassword: "Short123!",
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toContain("at least 12 characters");
+      }
+    });
+
+    it("rejects password exceeding 72 bytes", () => {
+      const result = registerSchema.safeParse({
+        email: "newauditor@partproof.io",
+        password: "a".repeat(73),
+        confirmPassword: "a".repeat(73),
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toContain("cannot exceed 72 bytes");
+      }
+    });
+
+    it("rejects mismatched confirm password", () => {
+      const result = registerSchema.safeParse({
+        email: "newauditor@partproof.io",
+        password: "PartProofSecure2026!",
+        confirmPassword: "DifferentPassword123!",
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toContain("Passwords do not match");
+      }
+    });
+
+    it("rejects invalid email address", () => {
+      const result = registerSchema.safeParse({
+        email: "invalid-email",
+        password: "PartProofSecure2026!",
+        confirmPassword: "PartProofSecure2026!",
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0].message).toContain("Invalid email address");
+      }
+    });
+
+    it("rejects missing confirm password", () => {
+      const result = registerSchema.safeParse({
+        email: "newauditor@partproof.io",
+        password: "PartProofSecure2026!",
+        confirmPassword: "",
+      });
+      expect(result.success).toBe(false);
     });
   });
 });

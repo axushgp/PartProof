@@ -8,7 +8,7 @@ from app.schemas.execution import (
     ArtifactRead,
     TaskDetail,
 )
-from app.schemas.auth import LoginRequest, Token, TokenPayload, UserRead
+from app.schemas.auth import LoginRequest, RegisterRequest, Token, TokenPayload, UserRead
 from app.schemas.system import HealthResponse, SystemStatus
 
 __all__ = [
@@ -28,6 +28,7 @@ __all__ = [
     "ArtifactRead",
     "TaskDetail",
     "LoginRequest",
+    "RegisterRequest",
     "Token",
     "TokenPayload",
     "UserRead",

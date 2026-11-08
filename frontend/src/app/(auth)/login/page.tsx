@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, Suspense } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -170,6 +171,16 @@ function LoginForm() {
                 Sign In to Console
               </Button>
             </form>
+
+            <div className="mt-5 text-center text-xs text-zinc-400">
+              Don&apos;t have an account?{" "}
+              <Link
+                href="/signup"
+                className="font-medium text-[#55D6C2] hover:underline transition-colors"
+              >
+                Create Auditor Account
+              </Link>
+            </div>
           </CardContent>
         </Card>
       </div>

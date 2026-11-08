@@ -52,6 +52,12 @@ export interface LoginRequest {
   password: string;
 }
 
+export interface RegisterRequest {
+  email: string;
+  password: string;
+  confirm_password?: string;
+}
+
 export interface Token {
   access_token: string;
   token_type: string;
